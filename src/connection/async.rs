@@ -12,7 +12,7 @@ use super::ConnectionMetadata;
 use crate::errors::Error;
 use crate::messages::{RequestMessage, ResponseMessage};
 use crate::trace;
-use crate::transport::common::{FibonacciBackoff, MAX_RECONNECT_ATTEMPTS};
+use crate::transport::common::{FibonacciBackoff, MAX_RECONNECT_ATTEMPTS, TWS_READ_TIMEOUT};
 use crate::transport::recorder::MessageRecorder;
 
 type Response = Result<ResponseMessage, Error>;
@@ -167,6 +167,15 @@ impl AsyncConnection {
     /// Read a message from the connection
     pub(crate) async fn read_message(&self) -> Response {
         let mut reader = self.reader.lock().await;
+
+        // Wait for data to arrive (cancellation-safe — no bytes consumed)
+        match tokio::time::timeout(TWS_READ_TIMEOUT, reader.readable()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(Error::Io(e)),
+            Err(_) => {
+                return Err(Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "read timeout")));
+            }
+        }
 
         // Read message length
         let mut length_bytes = [0u8; 4];

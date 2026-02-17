@@ -5,6 +5,9 @@ use std::time::Duration;
 /// Maximum number of reconnection attempts
 pub(crate) const MAX_RECONNECT_ATTEMPTS: i32 = 20;
 
+/// Read timeout for the TWS connection (shared by sync and async transports)
+pub(crate) const TWS_READ_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Fibonacci backoff for reconnection attempts
 pub(crate) struct FibonacciBackoff {
     previous: u64,

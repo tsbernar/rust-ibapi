@@ -9,7 +9,6 @@ use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
 use byteorder::{BigEndian, ReadBytesExt};
 use crossbeam::channel::{self, Receiver, Sender};
@@ -24,7 +23,7 @@ use crate::{server_versions, Error};
 
 // pub(crate) const MIN_SERVER_VERSION: i32 = 100;
 // pub(crate) const MAX_SERVER_VERSION: i32 = server_versions::WSH_EVENT_DATA_FILTERS_DATE;
-const TWS_READ_TIMEOUT: Duration = Duration::from_secs(1);
+use super::common::TWS_READ_TIMEOUT;
 
 // Defines the range of warning codes (2100–2169) used by the TWS API.
 const WARNING_CODES: RangeInclusive<i32> = 2100..=2169;
