@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Async snapshot market-data subscriptions no longer send a redundant cancel after the snapshot completes, matching the sync side (#686).
+- `Notice` now preserves the request or order ID decoded from TWS error frames, allowing consumers to associate broker rejections with the originating request.
 
 ## [3.1.0] - 2026-06-19
 

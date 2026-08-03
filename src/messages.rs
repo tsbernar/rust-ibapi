@@ -1084,6 +1084,10 @@ impl ResponseMessage {
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Notice {
+    /// Request or order identifier associated with the notice.
+    /// `None` indicates a connection-level or otherwise unrouted notice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<i32>,
     /// Error code reported by TWS.
     pub code: i32,
     /// Human-readable error message text.
@@ -1312,6 +1316,7 @@ impl Notice {
     /// [`HANDSHAKE_DECODE_FAILURE_CODE`]).
     pub(crate) fn synthesized(code: i32, message: String) -> Notice {
         Notice {
+            request_id: None,
             code,
             message,
             error_time: None,
@@ -1478,10 +1483,12 @@ impl From<crate::transport::routing::DecodedError> for Notice {
     /// `error_message` and `advanced_order_reject_json` strings and converting
     /// `error_time` (millis-since-epoch) to `OffsetDateTime`.
     fn from(payload: crate::transport::routing::DecodedError) -> Notice {
+        let request_id = (payload.request_id != crate::transport::routing::UNSPECIFIED_REQUEST_ID).then_some(payload.request_id);
         let error_time = payload
             .error_time
             .and_then(|millis| OffsetDateTime::from_unix_timestamp_nanos(millis as i128 * 1_000_000).ok());
         Notice {
+            request_id,
             code: payload.error_code,
             message: payload.error_message,
             error_time,
