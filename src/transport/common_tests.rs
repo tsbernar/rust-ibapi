@@ -47,3 +47,102 @@ fn test_fibonacci_backoff() {
     assert_eq!(backoff.next_delay(), Duration::from_secs(10)); // capped at max
     assert_eq!(backoff.next_delay(), Duration::from_secs(10)); // stays at max
 }
+
+#[test]
+fn error_route_owners_reject_cross_namespace_collisions() {
+    let owners = ErrorRouteOwners::default();
+    let request = owners.claim_request(42).unwrap().commit();
+    assert_eq!(owners.origin(42), Some(IdOrigin::Request));
+    assert!(matches!(owners.claim_order(42), Err(Error::InvalidArgument(_))));
+
+    owners.release_request(request);
+    owners.claim_order(42).unwrap().commit();
+    assert_eq!(owners.origin(42), Some(IdOrigin::Order));
+    assert!(matches!(owners.claim_request(42), Err(Error::InvalidArgument(_))));
+}
+
+#[test]
+fn stale_request_cleanup_cannot_release_a_new_generation() {
+    let owners = ErrorRouteOwners::default();
+    let old = owners.claim_request(42).unwrap().commit();
+    owners.release_request(old);
+    let _new = owners.claim_request(42).unwrap().commit();
+
+    owners.release_request(old);
+    assert_eq!(owners.origin(42), Some(IdOrigin::Request));
+}
+
+#[test]
+fn error_route_owner_claims_roll_back_only_when_no_write_committed() {
+    let owners = ErrorRouteOwners::default();
+    drop(owners.claim_order(42).unwrap());
+    assert_eq!(owners.origin(42), None);
+
+    let first = owners.claim_order(42).unwrap();
+    let second = owners.claim_order(42).unwrap();
+    first.commit();
+    drop(second);
+    assert_eq!(owners.origin(42), Some(IdOrigin::Order));
+}
+
+#[test]
+fn terminal_order_ownership_has_a_grace_period_then_expires() {
+    let owners = ErrorRouteOwners::default();
+    owners.claim_order(42).unwrap().commit();
+    owners.mark_order_terminal(42);
+    assert_eq!(owners.origin(42), Some(IdOrigin::Order));
+
+    owners.mark_order_terminal_with_grace(42, Duration::ZERO);
+    assert_eq!(owners.origin(42), None);
+    owners.claim_request(42).unwrap().commit();
+    assert_eq!(owners.origin(42), Some(IdOrigin::Request));
+}
+
+#[test]
+fn expiry_heap_prunes_terminal_orders_without_revisiting_their_ids() {
+    let owners = ErrorRouteOwners::default();
+    for id in 1..=100 {
+        owners.claim_order(id).unwrap().commit();
+        owners.mark_order_terminal_with_grace(id, Duration::ZERO);
+    }
+    owners.claim_request(1_000).unwrap().commit();
+
+    let state = owners.state.lock().unwrap();
+    assert_eq!(state.entries.len(), 1);
+    assert!(state.entries.contains_key(&1_000));
+    assert!(state.expirations.is_empty());
+}
+
+#[test]
+fn failed_order_refresh_restores_expiry_while_successful_refresh_clears_it() {
+    let owners = ErrorRouteOwners::default();
+    owners.claim_order(42).unwrap().commit();
+    owners.mark_order_terminal_with_grace(42, Duration::from_millis(10));
+    let failed_refresh = owners.claim_order(42).unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    drop(failed_refresh);
+    assert_eq!(owners.origin(42), None);
+
+    owners.claim_order(42).unwrap().commit();
+    owners.mark_order_terminal_with_grace(42, Duration::from_millis(10));
+    owners.claim_order(42).unwrap().commit();
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(owners.origin(42), Some(IdOrigin::Order));
+}
+
+#[test]
+fn terminal_status_during_pending_order_write_survives_commit() {
+    let owners = ErrorRouteOwners::default();
+    let initial_write = owners.claim_order(42).unwrap();
+    owners.mark_order_terminal_with_grace(42, Duration::ZERO);
+    initial_write.commit();
+    assert_eq!(owners.origin(42), None);
+
+    owners.claim_order(99).unwrap().commit();
+    let refresh = owners.claim_order(99).unwrap();
+    owners.mark_order_terminal_with_grace(99, Duration::from_millis(10));
+    refresh.commit();
+
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(owners.origin(99), None);
+}

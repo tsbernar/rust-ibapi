@@ -44,6 +44,8 @@ pub(crate) trait MessageBus: Send + Sync {
 
     fn send_order_request(&self, request_id: i32, packet: &[u8]) -> Result<InternalSubscription, Error>;
 
+    fn send_order_message(&self, order_id: i32, packet: &[u8]) -> Result<(), Error>;
+
     fn send_message(&self, packet: &[u8]) -> Result<(), Error>;
 
     fn create_order_update_subscription(&self) -> Result<InternalSubscription, Error>;
@@ -66,7 +68,9 @@ pub(crate) struct InternalSubscription {
     shared_receiver: Option<Arc<Receiver<RoutedItem>>>, // this channel is for responses that share channel based on message type
     signaler: Option<Sender<Signal>>,       // for client to signal termination
     pub(crate) request_id: Option<i32>,     // initiating request id
-    pub(crate) order_id: Option<i32>,       // initiating order id
+    request_owner: Option<common::IdOwnerToken>,
+    pub(crate) order_id: Option<i32>, // initiating order id
+    order_channel: Option<common::OrderChannelToken>,
     pub(crate) message_type: Option<OutgoingMessages>, // initiating message type
 }
 
@@ -161,18 +165,20 @@ impl InternalSubscription {
 #[cfg(feature = "sync")]
 impl Drop for InternalSubscription {
     fn drop(&mut self) {
-        if let (Some(request_id), Some(signaler)) = (self.request_id, &self.signaler) {
-            if let Err(e) = signaler.send(Signal::Request(request_id)) {
+        if let (Some(request_owner), Some(signaler)) = (self.request_owner, &self.signaler) {
+            if let Err(e) = signaler.send(Signal::Request(request_owner)) {
                 log::warn!("error sending drop signal: {e}");
             }
-        } else if let (Some(order_id), Some(signaler)) = (self.order_id, &self.signaler) {
-            if let Err(e) = signaler.send(Signal::Order(order_id)) {
+        } else if let (Some(order_channel), Some(signaler)) = (self.order_channel, &self.signaler) {
+            if let Err(e) = signaler.send(Signal::Order(order_channel)) {
                 log::warn!("error sending drop signal: {e}");
             }
-        } else if let Some(signaler) = &self.signaler {
-            // Currently is order update stream if no request or order id.
-            if let Err(e) = signaler.send(Signal::OrderUpdateStream) {
-                log::warn!("error sending drop signal: {e}");
+        } else if self.request_id.is_none() && self.order_id.is_none() {
+            if let Some(signaler) = &self.signaler {
+                // Currently is order update stream if no request or order id.
+                if let Err(e) = signaler.send(Signal::OrderUpdateStream) {
+                    log::warn!("error sending drop signal: {e}");
+                }
             }
         }
     }
@@ -181,10 +187,12 @@ impl Drop for InternalSubscription {
 // Signals are used to notify the backend when a subscriber is dropped.
 // This facilitates the cleanup of the SenderHashes.
 #[cfg(feature = "sync")]
-pub enum Signal {
-    Request(i32),
-    Order(i32),
+pub(crate) enum Signal {
+    Request(common::IdOwnerToken),
+    Order(common::OrderChannelToken),
     OrderUpdateStream,
+    #[cfg(test)]
+    Barrier(Sender<()>),
 }
 
 // SubscriptionBuilder for creating InternalSubscription instances
@@ -196,6 +204,8 @@ pub(crate) struct SubscriptionBuilder {
     signaler: Option<Sender<Signal>>,
     order_id: Option<i32>,
     request_id: Option<i32>,
+    request_owner: Option<common::IdOwnerToken>,
+    order_channel: Option<common::OrderChannelToken>,
     message_type: Option<OutgoingMessages>,
 }
 
@@ -209,6 +219,8 @@ impl SubscriptionBuilder {
             signaler: None,
             order_id: None,
             request_id: None,
+            request_owner: None,
+            order_channel: None,
             message_type: None,
         }
     }
@@ -238,8 +250,18 @@ impl SubscriptionBuilder {
         self
     }
 
+    pub(crate) fn order_channel(mut self, order_channel: common::OrderChannelToken) -> Self {
+        self.order_channel = Some(order_channel);
+        self
+    }
+
     pub(crate) fn request_id(mut self, request_id: i32) -> Self {
         self.request_id = Some(request_id);
+        self
+    }
+
+    pub(crate) fn request_owner(mut self, request_owner: common::IdOwnerToken) -> Self {
+        self.request_owner = Some(request_owner);
         self
     }
 
@@ -256,7 +278,9 @@ impl SubscriptionBuilder {
                 shared_receiver: None,
                 signaler: Some(signaler),
                 request_id: self.request_id,
+                request_owner: self.request_owner,
                 order_id: self.order_id,
+                order_channel: self.order_channel,
                 message_type: self.message_type,
             }
         } else if let Some(receiver) = self.shared_receiver {
@@ -266,7 +290,9 @@ impl SubscriptionBuilder {
                 shared_receiver: Some(receiver),
                 signaler: None,
                 request_id: self.request_id,
+                request_owner: self.request_owner,
                 order_id: self.order_id,
+                order_channel: self.order_channel,
                 message_type: self.message_type,
             }
         } else {

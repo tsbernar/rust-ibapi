@@ -1033,6 +1033,7 @@ fn test_data_advisory_with_request_id_keeps_stream_open() -> Result<(), Error> {
 fn test_hard_error_with_request_id_terminates_subscription() -> Result<(), Error> {
     let (stream, bus) = make_bus();
     let sub = bus.send_request(42, &[])?;
+    let stream_sub = bus.create_order_update_subscription()?;
 
     stream.push_inbound(error_frame(42, 200, "No security definition found"));
     bus.dispatch()?;
@@ -1045,6 +1046,10 @@ fn test_hard_error_with_request_id_terminates_subscription() -> Result<(), Error
         }
         other => panic!("expected RoutedItem::Error(Notice), got {other:?}"),
     }
+    assert!(
+        stream_sub.try_next_routed().is_none(),
+        "non-order request error leaked into the order-update stream"
+    );
     Ok(())
 }
 
@@ -1054,11 +1059,16 @@ fn test_hard_error_with_request_id_terminates_subscription() -> Result<(), Error
 fn test_warning_with_unspecified_id_is_log_only() -> Result<(), Error> {
     let (stream, bus) = make_bus();
     let sub = bus.send_request(42, &[])?;
+    let stream_sub = bus.create_order_update_subscription()?;
 
     stream.push_inbound(error_frame(-1, 2104, FARM_OK_MSG));
     bus.dispatch()?;
 
     assert!(sub.try_next_routed().is_none(), "unrouted notice must not be delivered to a subscription");
+    assert!(
+        stream_sub.try_next_routed().is_none(),
+        "unrouted notice must not be delivered to the order-update stream"
+    );
     Ok(())
 }
 
@@ -1498,6 +1508,110 @@ fn test_order_update_stream_receives_open_order() -> Result<(), Error> {
     Ok(())
 }
 
+/// A hard order rejection is nonterminal on the multiplexed order-update
+/// stream, but remains terminal for the order-specific subscription.
+#[test]
+fn test_order_update_stream_receives_typed_rejection_and_stays_open() -> Result<(), Error> {
+    let (stream, bus) = make_bus();
+    let order_sub = bus.send_order_request(42, &[])?;
+    let stream_sub = bus.create_order_update_subscription()?;
+
+    stream.push_inbound(binary_proto(
+        crate::messages::IncomingMessages::Error as i32,
+        &crate::proto::ErrorMessage {
+            id: Some(42),
+            error_code: Some(201),
+            error_msg: Some("No Trading Permission".into()),
+            advanced_order_reject_json: Some("{\"reason\":\"permission\"}".into()),
+            ..Default::default()
+        },
+    ));
+    bus.dispatch()?;
+
+    match stream_sub.next_timeout_routed(TICK).expect("global rejection missing") {
+        RoutedItem::Notice(notice) => {
+            assert_eq!(notice.request_id, Some(42));
+            assert_eq!(notice.code, 201);
+            assert_eq!(notice.message, "No Trading Permission");
+            assert_eq!(notice.advanced_order_reject_json, "{\"reason\":\"permission\"}");
+        }
+        other => panic!("expected global rejection Notice, got {other:?}"),
+    }
+    assert!(matches!(
+        order_sub.next_timeout_routed(TICK),
+        Some(RoutedItem::Error(Error::Notice(Notice {
+            request_id: Some(42),
+            code: 201,
+            ..
+        })))
+    ));
+
+    stream.push_inbound(binary_proto(
+        crate::messages::IncomingMessages::OrderStatus as i32,
+        &crate::proto::OrderStatus {
+            order_id: Some(42),
+            status: Some("Cancelled".into()),
+            ..Default::default()
+        },
+    ));
+    bus.dispatch()?;
+    match stream_sub.next_timeout_routed(TICK).expect("global stream ended after rejection") {
+        RoutedItem::Response(message) => {
+            assert_eq!(message.message_type(), crate::messages::IncomingMessages::OrderStatus)
+        }
+        other => panic!("global order stream terminated after rejection: {other:?}"),
+    }
+    Ok(())
+}
+
+/// Fire-and-forget orders have no order-specific channel, so origin tracking
+/// must still deliver their rejection to the multiplexed order stream. A
+/// terminal status retains the ID briefly so a late rejection remains scoped.
+#[test]
+fn test_fire_and_forget_order_rejection_is_scoped_through_terminal_grace() -> Result<(), Error> {
+    let (stream, bus) = make_bus();
+    let stream_sub = bus.create_order_update_subscription()?;
+    bus.send_order_message(42, &[])?;
+
+    assert!(matches!(bus.send_request(42, &[]), Err(Error::InvalidArgument(_))));
+
+    stream.push_inbound(error_frame(42, 201, "No Trading Permission"));
+    bus.dispatch()?;
+    assert!(matches!(
+        stream_sub.next_timeout_routed(TICK),
+        Some(RoutedItem::Notice(Notice {
+            request_id: Some(42),
+            code: 201,
+            ..
+        }))
+    ));
+
+    stream.push_inbound(binary_proto(
+        crate::messages::IncomingMessages::OrderStatus as i32,
+        &crate::proto::OrderStatus {
+            order_id: Some(42),
+            status: Some("Cancelled".into()),
+            ..Default::default()
+        },
+    ));
+    bus.dispatch()?;
+    assert!(stream_sub.next_timeout(TICK).is_some());
+
+    stream.push_inbound(error_frame(42, 201, "Late rejection detail"));
+    bus.dispatch()?;
+    assert!(matches!(
+        stream_sub.next_timeout_routed(TICK),
+        Some(RoutedItem::Notice(Notice {
+            request_id: Some(42),
+            code: 201,
+            ..
+        }))
+    ));
+
+    assert!(matches!(bus.send_request(42, &[]), Err(Error::InvalidArgument(_))));
+    Ok(())
+}
+
 /// Drop signals exercise `clean_request` / `clean_order` / `clear_order_update_stream`.
 /// The cleanup thread is signal-driven; we poll with a deadline rather than
 /// adding an ack channel to production code.
@@ -1522,9 +1636,55 @@ fn test_cleanup_thread_processes_drop_signals() -> Result<(), Error> {
     assert!(!bus.requests.contains(&42), "request 42 not cleaned");
     assert!(!bus.orders.contains(&99), "order 99 not cleaned");
     assert!(bus.order_update_stream.lock().unwrap().is_none(), "order update stream not cleared");
+    assert_eq!(bus.id_origins.origin(42), None);
+    assert_eq!(bus.id_origins.origin(99), Some(IdOrigin::Order));
 
     bus.request_shutdown();
     handle.join().expect("cleanup thread join");
+    Ok(())
+}
+
+#[test]
+fn test_stale_cleanup_cannot_remove_reused_request_or_order_channel() -> Result<(), Error> {
+    let (stream, bus) = make_bus();
+    let cleanup = bus.start_cleanup_thread();
+
+    let old_request = bus.send_request(42, &[])?;
+    bus.cancel_subscription(42, &[])?;
+    let new_request = bus.send_request(42, &[])?;
+    drop(old_request);
+
+    let old_order = bus.send_order_request(99, &[])?;
+    let new_order = bus.send_order_request(99, &[])?;
+    drop(old_order);
+
+    let (acknowledge, acknowledged) = channel::bounded(1);
+    bus.signals_send.send(Signal::Barrier(acknowledge)).unwrap();
+    acknowledged
+        .recv_timeout(TICK)
+        .expect("cleanup thread did not process stale drop signals");
+
+    stream.push_inbound(body("89|42|payload|"));
+    bus.dispatch()?;
+    new_request
+        .next_timeout(TICK)
+        .expect("stale request cleanup removed the replacement channel")?;
+
+    stream.push_inbound(binary_proto(
+        crate::messages::IncomingMessages::OrderStatus as i32,
+        &crate::proto::OrderStatus {
+            order_id: Some(99),
+            status: Some("Submitted".into()),
+            ..Default::default()
+        },
+    ));
+    bus.dispatch()?;
+    new_order
+        .next_timeout(TICK)
+        .expect("stale order cleanup removed the replacement channel")?;
+
+    bus.request_shutdown();
+    cleanup.join().expect("cleanup thread join");
     Ok(())
 }
 
@@ -1646,11 +1806,12 @@ fn test_response_with_no_recipient_dropped() -> Result<(), Error> {
 /// to exercise each `notify_all` branch.
 #[test]
 fn test_reset_notifies_all_channel_categories() -> Result<(), Error> {
-    let (_, bus) = make_bus();
+    let (stream, bus) = make_bus();
 
     let req = bus.send_request(100, &[])?;
     let order = bus.send_order_request(200, &[])?;
     let shared = bus.send_shared_request(OutgoingMessages::RequestCurrentTime, &[])?;
+    let updates = bus.create_order_update_subscription()?;
 
     bus.reset();
 
@@ -1661,5 +1822,18 @@ fn test_reset_notifies_all_channel_categories() -> Result<(), Error> {
 
     assert!(!bus.requests.contains(&100));
     assert!(!bus.orders.contains(&200));
+    assert_eq!(bus.id_origins.origin(100), None);
+    assert_eq!(bus.id_origins.origin(200), Some(IdOrigin::Order));
+
+    stream.push_inbound(error_frame(200, 201, "post-reconnect rejection"));
+    bus.dispatch()?;
+    assert!(matches!(
+        updates.next_timeout_routed(TICK),
+        Some(RoutedItem::Notice(Notice {
+            request_id: Some(200),
+            code: 201,
+            ..
+        }))
+    ));
     Ok(())
 }

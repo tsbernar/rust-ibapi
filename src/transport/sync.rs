@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::io::{prelude::*, Cursor};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -16,8 +16,10 @@ use log::{debug, error, info, warn};
 
 use crate::connection::sync::Connection;
 
-use super::common::log_orphan;
-use super::routing::{determine_routing, is_warning_error, order_routing_strategy, OrderRoutingStrategy, RoutingDecision, UNSPECIFIED_REQUEST_ID};
+use super::common::{log_orphan, ErrorRouteOwners, IdOrigin, IdOwnerToken, OrderChannelToken};
+use super::routing::{
+    determine_routing, is_warning_error, order_routing_strategy, terminal_order_id, OrderRoutingStrategy, RoutingDecision, UNSPECIFIED_REQUEST_ID,
+};
 use super::{InternalSubscription, MessageBus, Response, RoutedItem, Signal, SubscriptionBuilder};
 use crate::messages::{shared_channel_configuration, IncomingMessages, Notice, OutgoingMessages, ResponseMessage};
 use crate::subscriptions::notice_stream::sync_impl::NoticeStream;
@@ -145,6 +147,10 @@ pub struct TcpMessageBus<S: Stream> {
     handles: Mutex<Vec<JoinHandle<()>>>,
     requests: SenderHash<i32, RoutedItem>,
     orders: SenderHash<i32, RoutedItem>,
+    next_order_channel_generation: AtomicU64,
+    /// Rejects explicit cross-kind reuse of the ID shared by TWS request and
+    /// order error frames.
+    id_origins: ErrorRouteOwners,
     executions: SenderHash<String, RoutedItem>,
     shared_channels: SharedChannels,
     signals_send: Sender<Signal>,
@@ -166,6 +172,8 @@ impl<S: Stream> TcpMessageBus<S> {
             handles: Mutex::new(Vec::default()),
             requests: SenderHash::new(),
             orders: SenderHash::new(),
+            next_order_channel_generation: AtomicU64::new(0),
+            id_origins: ErrorRouteOwners::default(),
             executions: SenderHash::new(),
             shared_channels: SharedChannels::new(),
             signals_send,
@@ -192,6 +200,7 @@ impl<S: Stream> TcpMessageBus<S> {
         self.requests.clear();
         self.orders.clear();
         self.executions.clear();
+        self.id_origins.clear();
         self.connection.notice_broadcaster.close();
 
         self.connected.store(false, Ordering::Relaxed);
@@ -219,15 +228,27 @@ impl<S: Stream> TcpMessageBus<S> {
         self.requests.clear();
         self.orders.clear();
         self.executions.clear();
+        self.id_origins.clear_requests();
     }
 
-    fn clean_request(&self, request_id: i32) {
-        self.requests.remove(&request_id);
+    fn remove_request_channel(&self, request_owner: IdOwnerToken) {
+        self.requests.remove_generation(&request_owner.id, request_owner.generation);
+    }
+
+    fn remove_order_channel(&self, order_channel: OrderChannelToken) {
+        self.orders.remove_generation(&order_channel.id, order_channel.generation);
+    }
+
+    fn clean_request(&self, request_owner: IdOwnerToken) {
+        let request_id = request_owner.id;
+        self.remove_request_channel(request_owner);
+        self.id_origins.release_request(request_owner);
         debug!("released request_id {}, requests.len()={}", request_id, self.requests.len());
     }
 
-    fn clean_order(&self, order_id: i32) {
-        self.orders.remove(&order_id);
+    fn clean_order(&self, order_channel: OrderChannelToken) {
+        let order_id = order_channel.id;
+        self.remove_order_channel(order_channel);
         debug!("released order_id {}, orders.len()={}", order_id, self.orders.len());
     }
 
@@ -281,8 +302,8 @@ impl<S: Stream> TcpMessageBus<S> {
                 }
 
                 info!("successfully reconnected to TWS/Gateway");
-                self.connected.store(true, Ordering::Relaxed);
                 self.reset();
+                self.connected.store(true, Ordering::Relaxed);
                 Ok(())
             }
             Err(err) => {
@@ -315,21 +336,41 @@ impl<S: Stream> TcpMessageBus<S> {
     fn dispatch_message(&self, message: ResponseMessage) {
         match determine_routing(&message) {
             RoutingDecision::Error(payload) => {
-                let sent_to_update_stream = self.send_order_update(&message);
                 let request_id = payload.request_id;
                 let is_warning = is_warning_error(payload.error_code);
+                let notice = Notice::from(payload);
 
                 if request_id == UNSPECIFIED_REQUEST_ID {
-                    let notice = Notice::from(payload);
                     super::common::log_unrouted_notice(&notice);
                     self.connection.notice_broadcaster.broadcast(notice);
                 } else {
                     let item = if is_warning {
-                        RoutedItem::Notice(Notice::from(payload))
+                        RoutedItem::Notice(notice.clone())
                     } else {
-                        RoutedItem::Error(Error::from(payload))
+                        RoutedItem::Error(Error::Notice(notice.clone()))
                     };
-                    self.deliver_to_request_id(request_id, item, sent_to_update_stream);
+                    match self.id_origins.origin(request_id) {
+                        Some(IdOrigin::Request) => {
+                            if self.requests.contains(&request_id) {
+                                let _ = self.requests.send(&request_id, item);
+                            } else {
+                                log_orphan(request_id, &item);
+                            }
+                        }
+                        Some(IdOrigin::Order) => {
+                            // A multiplexed stream must remain alive after one
+                            // order is rejected, so its copy is a nonterminal
+                            // Notice while an order-specific stream retains the
+                            // terminal Error classification.
+                            let sent_to_update_stream = self.send_order_update_item(RoutedItem::Notice(notice));
+                            if self.orders.contains(&request_id) {
+                                let _ = self.orders.send(&request_id, item);
+                            } else if !sent_to_update_stream {
+                                log_orphan(request_id, &item);
+                            }
+                        }
+                        None => log_orphan(request_id, &item),
+                    }
                 }
             }
             RoutingDecision::ByOrderId(_) => {
@@ -363,20 +404,10 @@ impl<S: Stream> TcpMessageBus<S> {
         }
     }
 
-    /// Deliver a pre-classified Notice or Error to its owning subscription.
-    /// Tries the request-channel first, falls back to the order-channel for
-    /// notices/errors that arrive bound to an order_id.
-    fn deliver_to_request_id(&self, request_id: i32, item: RoutedItem, sent_to_update_stream: bool) {
-        if self.requests.contains(&request_id) {
-            let _ = self.requests.send(&request_id, item);
-        } else if self.orders.contains(&request_id) {
-            let _ = self.orders.send(&request_id, item);
-        } else if !sent_to_update_stream {
-            log_orphan(request_id, &item);
-        }
-    }
-
     fn process_orders(&self, message: ResponseMessage) {
+        if let Some(terminal_id) = terminal_order_id(&message) {
+            self.id_origins.mark_order_terminal(terminal_id);
+        }
         let strategy = order_routing_strategy(message.message_type());
 
         match strategy {
@@ -483,9 +514,14 @@ impl<S: Stream> TcpMessageBus<S> {
     // Sends an order update message to the order update stream if it exists.
     // Returns true if the message was sent to the order update stream.
     fn send_order_update(&self, message: &ResponseMessage) -> bool {
+        self.send_order_update_item(message.clone().into())
+    }
+
+    // Sends a pre-classified item to the order update stream if it exists.
+    fn send_order_update_item(&self, item: RoutedItem) -> bool {
         if let Ok(order_update_stream) = self.order_update_stream.lock() {
             if let Some(sender) = order_update_stream.as_ref() {
-                if let Err(e) = sender.send(message.clone().into()) {
+                if let Err(e) = sender.send(item) {
                     warn!("error sending to order update stream: {e}");
                     return false;
                 }
@@ -508,9 +544,13 @@ impl<S: Stream> TcpMessageBus<S> {
             loop {
                 crossbeam::select! {
                     recv(signal_recv) -> signal => match signal {
-                        Ok(Signal::Request(request_id)) => message_bus.clean_request(request_id),
-                        Ok(Signal::Order(order_id)) => message_bus.clean_order(order_id),
+                        Ok(Signal::Request(request_owner)) => message_bus.clean_request(request_owner),
+                        Ok(Signal::Order(order_channel)) => message_bus.clean_order(order_channel),
                         Ok(Signal::OrderUpdateStream) => message_bus.clear_order_update_stream(),
+                        #[cfg(test)]
+                        Ok(Signal::Barrier(acknowledge)) => {
+                            let _ = acknowledge.send(());
+                        }
                         Err(_) => {
                             debug!("cleanup signal channel closed");
                             return;
@@ -553,18 +593,25 @@ impl<S: Stream> TcpMessageBus<S> {
 
 impl<S: Stream> MessageBus for TcpMessageBus<S> {
     fn send_request(&self, request_id: i32, message: &[u8]) -> Result<InternalSubscription, Error> {
+        let claim = self.id_origins.claim_request(request_id)?;
+        let request_owner = claim.token();
         let (sender, receiver) = channel::unbounded();
         let sender_copy = sender.clone();
 
-        self.requests.insert(request_id, sender);
+        let previous_channel = self.requests.insert_generation(request_id, request_owner.generation, sender);
 
-        self.connection.write_message(message)?;
+        if let Err(error) = self.connection.write_message(message) {
+            self.requests.restore_generation(&request_id, request_owner.generation, previous_channel);
+            return Err(error);
+        }
+        claim.commit();
 
         let subscription = SubscriptionBuilder::new()
             .receiver(receiver)
             .sender(sender_copy)
             .signaler(self.signals_send.clone())
             .request_id(request_id)
+            .request_owner(request_owner)
             .build();
 
         Ok(subscription)
@@ -578,27 +625,45 @@ impl<S: Stream> MessageBus for TcpMessageBus<S> {
         }
 
         self.requests.remove(&request_id);
+        self.id_origins.release_request_id(request_id);
 
         Ok(())
     }
 
     fn send_order_request(&self, order_id: i32, message: &[u8]) -> Result<InternalSubscription, Error> {
+        let claim = self.id_origins.claim_order(order_id)?;
+        let order_channel = OrderChannelToken {
+            id: order_id,
+            generation: self.next_order_channel_generation.fetch_add(1, Ordering::Relaxed),
+        };
         let (sender, receiver) = channel::unbounded();
         let sender_copy = sender.clone();
 
-        self.orders.insert(order_id, sender);
+        let previous_channel = self.orders.insert_generation(order_id, order_channel.generation, sender);
         debug!("Registered order subscription for order_id={}", order_id);
 
-        self.connection.write_message(message)?;
+        if let Err(error) = self.connection.write_message(message) {
+            self.orders.restore_generation(&order_id, order_channel.generation, previous_channel);
+            return Err(error);
+        }
+        claim.commit();
 
         let subscription = SubscriptionBuilder::new()
             .receiver(receiver)
             .sender(sender_copy)
             .signaler(self.signals_send.clone())
             .order_id(order_id)
+            .order_channel(order_channel)
             .build();
 
         Ok(subscription)
+    }
+
+    fn send_order_message(&self, order_id: i32, message: &[u8]) -> Result<(), Error> {
+        let claim = self.id_origins.claim_order(order_id)?;
+        self.connection.write_message(message)?;
+        claim.commit();
+        Ok(())
     }
 
     fn send_message(&self, message: &[u8]) -> Result<(), Error> {
@@ -669,7 +734,13 @@ impl<S: Stream> MessageBus for TcpMessageBus<S> {
 
 #[derive(Debug)]
 struct SenderHash<K, V> {
-    senders: RwLock<HashMap<K, Sender<V>>>,
+    senders: RwLock<HashMap<K, SenderEntry<V>>>,
+}
+
+#[derive(Debug)]
+struct SenderEntry<V> {
+    generation: u64,
+    sender: Sender<V>,
 }
 
 impl<K: std::hash::Hash + Eq + std::fmt::Debug, V: std::fmt::Debug> SenderHash<K, V> {
@@ -682,8 +753,8 @@ impl<K: std::hash::Hash + Eq + std::fmt::Debug, V: std::fmt::Debug> SenderHash<K
     pub fn send(&self, id: &K, message: V) -> Result<(), Error> {
         let senders = self.senders.read().unwrap();
         debug!("senders: {senders:?}");
-        if let Some(sender) = senders.get(id) {
-            if let Err(err) = sender.send(message) {
+        if let Some(entry) = senders.get(id) {
+            if let Err(err) = entry.sender.send(message) {
                 warn!("error sending: {id:?}, {err}")
             }
         } else {
@@ -694,17 +765,44 @@ impl<K: std::hash::Hash + Eq + std::fmt::Debug, V: std::fmt::Debug> SenderHash<K
 
     pub fn copy_sender(&self, id: K) -> Option<Sender<V>> {
         let senders = self.senders.read().unwrap();
-        senders.get(&id).cloned()
+        senders.get(&id).map(|entry| entry.sender.clone())
     }
 
     pub fn insert(&self, id: K, message: Sender<V>) -> Option<Sender<V>> {
+        self.insert_generation(id, 0, message).map(|entry| entry.sender)
+    }
+
+    fn insert_generation(&self, id: K, generation: u64, sender: Sender<V>) -> Option<SenderEntry<V>> {
         let mut senders = self.senders.write().unwrap();
-        senders.insert(id, message)
+        senders.insert(id, SenderEntry { generation, sender })
+    }
+
+    fn restore_generation(&self, id: &K, failed_generation: u64, previous: Option<SenderEntry<V>>)
+    where
+        K: Clone,
+    {
+        let mut senders = self.senders.write().unwrap();
+        if senders.get(id).is_some_and(|entry| entry.generation == failed_generation) {
+            if let Some(previous) = previous {
+                senders.insert(id.clone(), previous);
+            } else {
+                senders.remove(id);
+            }
+        }
     }
 
     pub fn remove(&self, id: &K) -> Option<Sender<V>> {
         let mut senders = self.senders.write().unwrap();
-        senders.remove(id)
+        senders.remove(id).map(|entry| entry.sender)
+    }
+
+    pub fn remove_generation(&self, id: &K, generation: u64) -> Option<Sender<V>> {
+        let mut senders = self.senders.write().unwrap();
+        if senders.get(id).is_some_and(|entry| entry.generation == generation) {
+            senders.remove(id).map(|entry| entry.sender)
+        } else {
+            None
+        }
     }
 
     pub fn contains(&self, id: &K) -> bool {
@@ -727,8 +825,8 @@ impl<K: std::hash::Hash + Eq + std::fmt::Debug, V: std::fmt::Debug> SenderHash<K
         F: Fn() -> V,
     {
         let senders = self.senders.read().unwrap();
-        for sender in senders.values() {
-            if let Err(e) = sender.send(message_fn()) {
+        for entry in senders.values() {
+            if let Err(e) = entry.sender.send(message_fn()) {
                 warn!("error sending notification: {e}");
             }
         }

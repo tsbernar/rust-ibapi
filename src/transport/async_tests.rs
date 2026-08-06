@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::*;
-use crate::common::test_utils::helpers::{binary_proto, error_frame};
+use crate::common::test_utils::helpers::{binary_proto, error_frame, managed_accounts_frame, next_valid_id_frame};
 use crate::connection::r#async::AsyncConnection;
 use crate::messages::OutgoingMessages;
 use crate::server_versions;
@@ -44,6 +44,13 @@ fn make_bus() -> (MemoryStream, Arc<AsyncTcpMessageBus<MemoryStream>>) {
     connection.set_server_version_for_test(server_versions::PROTOBUF_REST_MESSAGES_3);
     let bus = Arc::new(AsyncTcpMessageBus::new(connection).unwrap());
     (stream, bus)
+}
+
+fn push_reconnect_handshake(stream: &MemoryStream) {
+    let handshake = format!("{}\020240120 12:00:00 EST\0", server_versions::PROTOBUF_REST_MESSAGES_3);
+    stream.push_inbound(handshake.into_bytes());
+    stream.push_inbound(next_valid_id_frame(90));
+    stream.push_inbound(managed_accounts_frame("DU1234567"));
 }
 
 const TICK: Duration = Duration::from_millis(100);
@@ -320,6 +327,7 @@ async fn test_data_advisory_with_request_id_keeps_stream_open() {
 async fn test_hard_error_with_request_id_terminates_subscription() {
     let (stream, bus) = make_bus();
     let mut sub = bus.send_request(42, vec![]).await.unwrap();
+    let mut stream_sub = bus.create_order_update_subscription().await.unwrap();
 
     stream.push_inbound(error_frame(42, 200, "No security definition found"));
     bus.read_and_route_message().await.unwrap();
@@ -332,6 +340,10 @@ async fn test_hard_error_with_request_id_terminates_subscription() {
         }
         other => panic!("expected RoutedItem::Error(Notice), got {other:?}"),
     }
+    assert!(
+        stream_sub.try_next_routed().is_none(),
+        "non-order request error leaked into the order-update stream"
+    );
 }
 
 /// Warning with `UNSPECIFIED_REQUEST_ID` has no owner — log only, no channel
@@ -340,11 +352,16 @@ async fn test_hard_error_with_request_id_terminates_subscription() {
 async fn test_warning_with_unspecified_id_is_log_only() {
     let (stream, bus) = make_bus();
     let mut sub = bus.send_request(42, vec![]).await.unwrap();
+    let mut stream_sub = bus.create_order_update_subscription().await.unwrap();
 
     stream.push_inbound(error_frame(-1, 2104, FARM_OK_MSG));
     bus.read_and_route_message().await.unwrap();
 
     assert!(sub.try_next_routed().is_none(), "unrouted notice must not be delivered to a subscription");
+    assert!(
+        stream_sub.try_next_routed().is_none(),
+        "unrouted notice must not be delivered to the order-update stream"
+    );
 }
 
 /// Order-channel fallback: a notice arrives bound to an `order_id` matching
@@ -788,6 +805,238 @@ async fn test_order_update_stream_receives_open_order() {
     next_message(&mut stream_sub).await;
 }
 
+/// A hard order rejection is nonterminal on the multiplexed order-update
+/// stream, but remains terminal for the order-specific subscription.
+#[tokio::test]
+async fn test_order_update_stream_receives_typed_rejection_and_stays_open() {
+    let (stream, bus) = make_bus();
+    let mut order_sub = bus.send_order_request(42, vec![]).await.unwrap();
+    let mut stream_sub = bus.create_order_update_subscription().await.unwrap();
+
+    stream.push_inbound(binary_proto(
+        crate::messages::IncomingMessages::Error as i32,
+        &crate::proto::ErrorMessage {
+            id: Some(42),
+            error_code: Some(201),
+            error_msg: Some("No Trading Permission".into()),
+            advanced_order_reject_json: Some("{\"reason\":\"permission\"}".into()),
+            ..Default::default()
+        },
+    ));
+    bus.read_and_route_message().await.unwrap();
+
+    match next_routed(&mut stream_sub).await {
+        RoutedItem::Notice(notice) => {
+            assert_eq!(notice.request_id, Some(42));
+            assert_eq!(notice.code, 201);
+            assert_eq!(notice.message, "No Trading Permission");
+            assert_eq!(notice.advanced_order_reject_json, "{\"reason\":\"permission\"}");
+        }
+        other => panic!("expected global rejection Notice, got {other:?}"),
+    }
+    assert!(matches!(
+        next_routed(&mut order_sub).await,
+        RoutedItem::Error(Error::Notice(Notice {
+            request_id: Some(42),
+            code: 201,
+            ..
+        }))
+    ));
+
+    stream.push_inbound(binary_proto(
+        crate::messages::IncomingMessages::OrderStatus as i32,
+        &crate::proto::OrderStatus {
+            order_id: Some(42),
+            status: Some("Cancelled".into()),
+            ..Default::default()
+        },
+    ));
+    bus.read_and_route_message().await.unwrap();
+    match next_routed(&mut stream_sub).await {
+        RoutedItem::Response(message) => {
+            assert_eq!(message.message_type(), crate::messages::IncomingMessages::OrderStatus)
+        }
+        other => panic!("global order stream terminated after rejection: {other:?}"),
+    }
+}
+
+/// Fire-and-forget orders have no order-specific channel, so origin tracking
+/// must still deliver their rejection to the multiplexed order stream. A
+/// terminal status retains the ID briefly so a late rejection remains scoped.
+#[tokio::test]
+async fn test_fire_and_forget_order_rejection_is_scoped_through_terminal_grace() {
+    let (stream, bus) = make_bus();
+    let mut stream_sub = bus.create_order_update_subscription().await.unwrap();
+    bus.send_order_message(42, vec![]).await.unwrap();
+
+    assert!(matches!(bus.send_request(42, vec![]).await, Err(Error::InvalidArgument(_))));
+
+    stream.push_inbound(error_frame(42, 201, "No Trading Permission"));
+    bus.read_and_route_message().await.unwrap();
+    assert!(matches!(
+        next_routed(&mut stream_sub).await,
+        RoutedItem::Notice(Notice {
+            request_id: Some(42),
+            code: 201,
+            ..
+        })
+    ));
+
+    stream.push_inbound(binary_proto(
+        crate::messages::IncomingMessages::OrderStatus as i32,
+        &crate::proto::OrderStatus {
+            order_id: Some(42),
+            status: Some("Cancelled".into()),
+            ..Default::default()
+        },
+    ));
+    bus.read_and_route_message().await.unwrap();
+    next_message(&mut stream_sub).await;
+
+    stream.push_inbound(error_frame(42, 201, "Late rejection detail"));
+    bus.read_and_route_message().await.unwrap();
+    assert!(matches!(
+        next_routed(&mut stream_sub).await,
+        RoutedItem::Notice(Notice {
+            request_id: Some(42),
+            code: 201,
+            ..
+        })
+    ));
+
+    assert!(matches!(bus.send_request(42, vec![]).await, Err(Error::InvalidArgument(_))));
+}
+
+#[tokio::test]
+async fn cancelled_order_send_retains_routing_ownership_after_bytes_are_emitted() {
+    let (stream, bus) = make_bus();
+    let mut updates = bus.create_order_update_subscription().await.unwrap();
+    stream.block_next_write();
+
+    let sender = bus.clone();
+    let send = tokio::spawn(async move { sender.send_order_message(42, vec![1, 2, 3]).await });
+    stream.wait_for_write_started().await;
+    send.abort();
+    assert!(send.await.unwrap_err().is_cancelled());
+    stream.release_write();
+
+    assert_eq!(bus.id_origins.origin(42), Some(IdOrigin::Order));
+    stream.push_inbound(error_frame(42, 201, "No Trading Permission"));
+    bus.read_and_route_message().await.unwrap();
+    assert!(matches!(
+        next_routed(&mut updates).await,
+        RoutedItem::Notice(Notice {
+            request_id: Some(42),
+            code: 201,
+            ..
+        })
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn epoch_rejected_order_writes_rollback_without_reactivating_terminal_owner() {
+    let (stream, bus) = make_bus();
+    bus.send_order_message(43, b"initial-order".to_vec()).await.unwrap();
+    bus.id_origins.mark_order_terminal(43);
+    let original_expiration = bus.id_origins.order_expiration(43).expect("terminal owner must have a grace expiry");
+
+    stream.block_next_write();
+    let blocking_epoch = bus.begin_write().unwrap();
+    let blocking_write = bus.enqueue_write_message(b"blocking-write".to_vec(), blocking_epoch).unwrap();
+    stream.wait_for_write_started().await;
+
+    let stale_epoch = bus.begin_write().unwrap();
+    let new_claim = bus.id_origins.claim_order(42).unwrap().into_owned(bus.id_origins.clone());
+    let new_write = bus
+        .enqueue_order_write_message(b"unsent-new-order".to_vec(), stale_epoch, new_claim)
+        .unwrap();
+    let modify_claim = bus.id_origins.claim_order(43).unwrap().into_owned(bus.id_origins.clone());
+    let modify_write = bus
+        .enqueue_order_write_message(b"unsent-modify".to_vec(), stale_epoch, modify_claim)
+        .unwrap();
+
+    bus.connection_epoch.fetch_add(1, Ordering::AcqRel);
+    stream.release_write();
+    AsyncTcpMessageBus::<MemoryStream>::finish_write_message(blocking_write).await.unwrap();
+    assert!(matches!(
+        AsyncTcpMessageBus::<MemoryStream>::finish_write_message(new_write).await,
+        Err(Error::ConnectionReset)
+    ));
+    assert!(matches!(
+        AsyncTcpMessageBus::<MemoryStream>::finish_write_message(modify_write).await,
+        Err(Error::ConnectionReset)
+    ));
+
+    assert_eq!(bus.id_origins.origin(42), None);
+    assert_eq!(bus.id_origins.origin(43), Some(IdOrigin::Order));
+    assert_eq!(bus.id_origins.order_expiration(43), Some(original_expiration));
+    let captured = stream.captured();
+    assert!(!captured.windows(b"unsent-new-order".len()).any(|bytes| bytes == b"unsent-new-order"));
+    assert!(!captured.windows(b"unsent-modify".len()).any(|bytes| bytes == b"unsent-modify"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_result_is_reported_only_after_queued_order_claim_is_rolled_back() {
+    let (stream, bus) = make_bus();
+    stream.block_next_write();
+    let epoch = bus.begin_write().unwrap();
+    let blocking_write = bus.enqueue_write_message(b"blocking-write".to_vec(), epoch).unwrap();
+    stream.wait_for_write_started().await;
+
+    let (acknowledged, acknowledgement) = oneshot::channel();
+    assert!(bus.write_sender.send(WriteCommand::Shutdown { acknowledged }).is_ok());
+    let claim = bus.id_origins.claim_order(42).unwrap().into_owned(bus.id_origins.clone());
+    let queued_order = bus.enqueue_order_write_message(b"unsent-order".to_vec(), epoch, claim).unwrap();
+
+    stream.release_write();
+    AsyncTcpMessageBus::<MemoryStream>::finish_write_message(blocking_write).await.unwrap();
+    assert!(matches!(
+        AsyncTcpMessageBus::<MemoryStream>::finish_write_message(queued_order).await,
+        Err(Error::Shutdown)
+    ));
+    assert_eq!(bus.id_origins.origin(42), None);
+    drop(
+        bus.id_origins
+            .claim_request(42)
+            .expect("shutdown result must guarantee the stale order owner is gone"),
+    );
+    acknowledgement.await.expect("writer did not acknowledge shutdown");
+}
+
+#[tokio::test]
+async fn request_started_during_reconnect_is_rejected_without_dead_routing() {
+    let (stream, bus) = make_bus();
+    stream.block_next_write();
+
+    let reconnecting_bus = bus.clone();
+    let reconnect = tokio::spawn(async move { reconnecting_bus.reconnect_and_reset().await });
+    tokio::time::timeout(TICK, stream.wait_for_write_started())
+        .await
+        .expect("reconnect did not reach its handshake write");
+
+    let during_reconnect = b"during-reconnect".to_vec();
+    assert!(matches!(
+        bus.send_request(42, during_reconnect.clone()).await,
+        Err(Error::ConnectionReset)
+    ));
+    assert!(bus.request_channels.read().await.get(&42).is_none());
+    assert_eq!(bus.id_origins.origin(42), None);
+    assert!(!stream.captured().windows(during_reconnect.len()).any(|bytes| bytes == during_reconnect));
+
+    push_reconnect_handshake(&stream);
+    stream.release_write();
+    tokio::time::timeout(Duration::from_secs(1), reconnect)
+        .await
+        .expect("reconnect did not complete")
+        .expect("reconnect task panicked")
+        .expect("reconnect failed");
+    assert!(bus.is_connected());
+
+    let after_reconnect = b"after-reconnect".to_vec();
+    let _subscription = bus.send_request(43, after_reconnect.clone()).await.unwrap();
+    assert!(stream.captured().windows(after_reconnect.len()).any(|bytes| bytes == after_reconnect));
+}
+
 /// Routed-but-orphan notice (real request_id, no matching sub) takes the
 /// `log_orphan` path, NOT the global notice stream.
 #[tokio::test]
@@ -809,10 +1058,11 @@ async fn test_warning_with_orphan_request_id_logs() {
 /// cleared.
 #[tokio::test]
 async fn test_reset_channels_notifies_in_flight_subscriptions() {
-    let (_, bus) = make_bus();
+    let (stream, bus) = make_bus();
 
     let mut req = bus.send_request(100, vec![]).await.unwrap();
     let mut order = bus.send_order_request(200, vec![]).await.unwrap();
+    let mut updates = bus.create_order_update_subscription().await.unwrap();
 
     bus.reset_channels().await;
 
@@ -827,6 +1077,76 @@ async fn test_reset_channels_notifies_in_flight_subscriptions() {
     assert!(bus.request_channels.read().await.is_empty());
     assert!(bus.order_channels.read().await.is_empty());
     assert!(bus.execution_channels.read().await.is_empty());
+    assert_eq!(bus.id_origins.origin(100), None);
+    assert_eq!(bus.id_origins.origin(200), Some(IdOrigin::Order));
+
+    stream.push_inbound(error_frame(200, 201, "post-reconnect rejection"));
+    bus.read_and_route_message().await.unwrap();
+    assert!(matches!(
+        next_routed(&mut updates).await,
+        RoutedItem::Notice(Notice {
+            request_id: Some(200),
+            code: 201,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn test_subscription_drop_releases_request_owner_but_retains_order_owner() {
+    let (_, bus) = make_bus();
+    let request = bus.send_request(42, vec![]).await.unwrap();
+    let order = bus.send_order_request(99, vec![]).await.unwrap();
+    drop(request);
+    drop(order);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        if bus.request_channels.read().await.get(&42).is_none() && bus.order_channels.read().await.get(&99).is_none() {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "cleanup signals were not processed");
+        tokio::task::yield_now().await;
+    }
+
+    assert_eq!(bus.id_origins.origin(42), None);
+    assert_eq!(bus.id_origins.origin(99), Some(IdOrigin::Order));
+}
+
+#[tokio::test]
+async fn test_stale_cleanup_cannot_remove_reused_request_or_order_channel() {
+    let (stream, bus) = make_bus();
+
+    let old_request = bus.send_request(42, vec![]).await.unwrap();
+    bus.cancel_subscription(42, vec![]).await.unwrap();
+    let mut new_request = bus.send_request(42, vec![]).await.unwrap();
+
+    drop(old_request);
+
+    let old_order = bus.send_order_request(99, vec![]).await.unwrap();
+    let mut new_order = bus.send_order_request(99, vec![]).await.unwrap();
+    drop(old_order);
+
+    let acknowledged = Arc::new(Notify::new());
+    bus.cleanup_sender.send(CleanupSignal::Barrier(acknowledged.clone())).unwrap();
+    tokio::time::timeout(TICK, acknowledged.notified())
+        .await
+        .expect("cleanup task did not process stale drop signals");
+
+    stream.push_inbound(body("89|42|payload|"));
+    bus.read_and_route_message().await.unwrap();
+    next_message(&mut new_request).await;
+
+    stream.push_inbound(binary_proto(
+        crate::messages::IncomingMessages::OrderStatus as i32,
+        &crate::proto::OrderStatus {
+            order_id: Some(99),
+            status: Some("Submitted".into()),
+            ..Default::default()
+        },
+    ));
+    bus.read_and_route_message().await.unwrap();
+    next_message(&mut new_order).await;
 }
 
 /// `ensure_shutdown` joins the running message-processing task and reports

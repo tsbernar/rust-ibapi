@@ -116,6 +116,11 @@ impl MessageBus for MessageBusStub {
         Ok(mock_request(self, Some(request_id), None, message))
     }
 
+    fn send_order_message(&self, _order_id: i32, message: &[u8]) -> Result<(), Error> {
+        self.request_messages.write().unwrap().push(message.to_vec());
+        Ok(())
+    }
+
     fn send_message(&self, message: &[u8]) -> Result<(), Error> {
         self.request_messages.write().unwrap().push(message.to_vec());
         Ok(())
@@ -226,6 +231,11 @@ impl AsyncMessageBus for MessageBusStub {
         }
 
         Ok(AsyncInternalSubscription::new(receiver))
+    }
+
+    async fn send_order_message(&self, _order_id: i32, message: Vec<u8>) -> Result<(), Error> {
+        self.request_messages.write().unwrap().push(message);
+        Ok(())
     }
 
     async fn send_shared_request(&self, _message_type: OutgoingMessages, message: Vec<u8>) -> Result<AsyncInternalSubscription, Error> {

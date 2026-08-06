@@ -135,6 +135,17 @@ pub(crate) fn order_routing_strategy(message_type: IncomingMessages) -> OrderRou
     }
 }
 
+/// Return the order ID when an OrderStatus frame proves that the ID can no
+/// longer produce order-scoped errors on this connection.
+pub(crate) fn terminal_order_id(message: &ResponseMessage) -> Option<i32> {
+    if message.message_type() != IncomingMessages::OrderStatus {
+        return None;
+    }
+    let mut message = message.clone();
+    let status = crate::orders::common::decode_order_status(&mut message).ok()?;
+    status.status.is_terminal().then_some(status.order_id)
+}
+
 /// Check if an error code is a warning.
 ///
 /// Warnings ([`WARNING_CODE_RANGE`]) and data advisories

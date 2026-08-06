@@ -172,10 +172,11 @@ impl Client {
         Ok(())
     }
 
-    /// Gets the next valid order ID from the TWS server.
+    /// Reserves the next valid order ID after synchronizing with TWS.
     ///
-    /// Unlike [Self::next_order_id], this function requests the next valid order ID from the TWS server and updates the client's internal order ID sequence.
-    /// This can be for ensuring that order IDs are unique across multiple clients.
+    /// Unlike [Self::next_order_id], this function first requests the server's
+    /// order-ID floor. The returned ID is unique across this client's request
+    /// and order allocations and is never lower than that floor.
     ///
     /// Use this method when coordinating order IDs across multiple client instances or when you need to synchronize with the server's order ID sequence at the start of a session.
     ///
@@ -197,11 +198,8 @@ impl Client {
         let subscription = self.send_shared_request(OutgoingMessages::RequestIds, message)?;
 
         if let Some(Ok(message)) = subscription.next() {
-            let next_order_id = decoders::decode_next_valid_id(&message)?;
-
-            self.set_next_order_id(next_order_id);
-
-            Ok(next_order_id)
+            let server_order_id = decoders::decode_next_valid_id(&message)?;
+            Ok(self.reserve_order_id_at_least(server_order_id))
         } else {
             Err(Error::UnexpectedEndOfStream)
         }
@@ -336,7 +334,7 @@ impl Client {
         verify::verify_order_contract(self, contract, order_id)?;
 
         let request = encoders::encode_place_order(order_id, contract, order)?;
-        self.send_message(request)?;
+        self.send_order_message(order_id, request)?;
 
         Ok(())
     }
@@ -412,6 +410,10 @@ impl Client {
     ///
     /// This stream provides updates for all orders, not just a specific order.
     /// To track a specific order, filter the updates by order ID.
+    /// Errors for order IDs submitted through this connection arrive as nonterminal
+    /// [`SubscriptionItem::Notice`](crate::subscriptions::SubscriptionItem::Notice)
+    /// values; match [`Notice::request_id`](crate::Notice::request_id) to the
+    /// order ID when associating rejection diagnostics.
     ///
     /// To pair a [`CommissionReport`](crate::orders::CommissionReport) with the
     /// [`ExecutionData`](crate::orders::ExecutionData) it belongs to, join on
