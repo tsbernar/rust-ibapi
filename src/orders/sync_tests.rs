@@ -224,7 +224,20 @@ fn next_valid_order_id() {
     assert_request(&message_bus, 0, &next_valid_order_id_request());
 
     assert!(results.is_ok(), "failed to request next order id: {}", results.err().unwrap());
-    assert_eq!(43, results.unwrap(), "next order id");
+    assert_eq!(9000, results.unwrap(), "next reserved order id");
+}
+
+#[test]
+fn next_valid_order_id_honors_a_higher_server_floor() {
+    let next_valid_id_proto = crate::proto::NextValidId { order_id: Some(12_000) };
+    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_response(
+        IncomingMessages::NextValidId,
+        prost::Message::encode_to_vec(&next_valid_id_proto),
+    )]));
+    let client = Client::stubbed(message_bus, server_versions::SIZE_RULES);
+
+    assert_eq!(client.next_valid_order_id().unwrap(), 12_000);
+    assert_eq!(client.next_request_id(), 12_001);
 }
 
 #[test]

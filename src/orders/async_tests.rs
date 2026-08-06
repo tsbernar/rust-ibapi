@@ -393,12 +393,33 @@ async fn test_next_valid_order_id() {
 
     let order_id = client.next_valid_order_id().await.expect("failed to get next valid order id");
 
-    assert_eq!(order_id, 123, "Expected order ID 123");
-    assert_eq!(client.next_order_id(), 123, "Client's order ID should be updated to 123");
-    assert_ne!(client.next_order_id(), initial_order_id, "Client's order ID should have changed");
+    assert_eq!(
+        order_id,
+        initial_order_id + 1,
+        "the method must reserve a fresh ID rather than return the stale server floor"
+    );
+    assert_eq!(
+        client.next_order_id(),
+        initial_order_id + 2,
+        "a lower server next-valid ID must not rewind the shared allocator"
+    );
+    assert_eq!(client.next_order_id(), initial_order_id + 3);
 
     assert_eq!(request_message_count(&message_bus), 1);
     assert_request(&message_bus, 0, &next_valid_order_id_request());
+}
+
+#[tokio::test]
+async fn test_next_valid_order_id_honors_a_higher_server_floor() {
+    let next_valid_id_proto = crate::proto::NextValidId { order_id: Some(12_000) };
+    let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_response(
+        IncomingMessages::NextValidId,
+        prost::Message::encode_to_vec(&next_valid_id_proto),
+    )]));
+    let client = Client::stubbed(message_bus, server_versions::SIZE_RULES);
+
+    assert_eq!(client.next_valid_order_id().await.unwrap(), 12_000);
+    assert_eq!(client.next_request_id(), 12_001);
 }
 
 #[tokio::test]

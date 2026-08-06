@@ -54,8 +54,23 @@ fn test_id_generator_thread_safe() {
 }
 
 #[test]
+fn reserve_at_least_is_atomic_and_never_rewinds() {
+    let gen = Arc::new(IdGenerator::new(9_000));
+    let mut handles = vec![];
+    for _ in 0..10 {
+        let gen = Arc::clone(&gen);
+        handles.push(thread::spawn(move || (0..100).map(|_| gen.reserve_at_least(10_000)).collect::<Vec<_>>()));
+    }
+
+    let mut ids = handles.into_iter().flat_map(|handle| handle.join().unwrap()).collect::<Vec<_>>();
+    ids.sort_unstable();
+    assert_eq!(ids, (10_000..11_000).collect::<Vec<_>>());
+    assert_eq!(gen.reserve_at_least(123), 11_000);
+}
+
+#[test]
 fn test_request_id_generator() {
-    let gen = IdGenerator::new_request_id_generator();
+    let gen = IdGenerator::new(INITIAL_REQUEST_ID);
     assert_eq!(gen.current(), INITIAL_REQUEST_ID);
     assert_eq!(gen.next(), INITIAL_REQUEST_ID);
     assert_eq!(gen.next(), INITIAL_REQUEST_ID + 1);
@@ -65,18 +80,19 @@ fn test_request_id_generator() {
 fn test_client_id_manager() {
     let manager = ClientIdManager::new(50);
 
-    // Test request IDs
+    // Requests and orders share one monotonic namespace because TWS Error
+    // frames do not identify which kind their integer ID belongs to.
     assert_eq!(manager.current_request_id(), INITIAL_REQUEST_ID);
     assert_eq!(manager.next_request_id(), INITIAL_REQUEST_ID);
     assert_eq!(manager.next_request_id(), INITIAL_REQUEST_ID + 1);
+    assert_eq!(manager.current_order_id(), INITIAL_REQUEST_ID + 2);
+    assert_eq!(manager.next_order_id(), INITIAL_REQUEST_ID + 2);
+    assert_eq!(manager.next_request_id(), INITIAL_REQUEST_ID + 3);
 
-    // Test order IDs
-    assert_eq!(manager.current_order_id(), 50);
-    assert_eq!(manager.next_order_id(), 50);
-    assert_eq!(manager.next_order_id(), 51);
-
-    // Test order ID update
+    // A lower server next-valid ID cannot rewind the shared allocator.
     manager.set_order_id(100);
-    assert_eq!(manager.next_order_id(), 100);
-    assert_eq!(manager.next_order_id(), 101);
+    assert_eq!(manager.next_order_id(), INITIAL_REQUEST_ID + 4);
+
+    manager.set_order_id(10_000);
+    assert_eq!(manager.next_request_id(), 10_000);
 }

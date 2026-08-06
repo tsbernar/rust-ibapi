@@ -18,6 +18,13 @@ impl Client {
     /// `execution_id` — the two arrive in either order but share that key. See
     /// the [`CommissionReport`] docs for the idiom.
     ///
+    /// Errors for order IDs submitted through this connection are delivered as nonterminal
+    /// [`SubscriptionItem::Notice`](crate::subscriptions::SubscriptionItem::Notice)
+    /// values so one rejected order does not terminate this multiplexed stream.
+    /// Poll the raw subscription rather than `filter_data()` when rejection
+    /// diagnostics are required, and match [`Notice::request_id`](crate::Notice::request_id)
+    /// to the order ID.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -74,7 +81,7 @@ impl Client {
         verify::verify_order_contract(self, contract, order_id)?;
 
         let request = encoders::encode_place_order(order_id, contract, order)?;
-        self.send_message(request).await?;
+        self.send_order_message(order_id, request).await?;
 
         Ok(())
     }
@@ -177,7 +184,10 @@ impl Client {
         Ok(())
     }
 
-    /// Gets next valid order id
+    /// Reserves the next valid order ID after synchronizing with TWS.
+    ///
+    /// The returned ID is unique across this client's request and order
+    /// allocations and is never lower than the server-provided order-ID floor.
     ///
     /// # Examples
     ///
@@ -198,11 +208,8 @@ impl Client {
 
         match internal_subscription.next().await {
             Some(Ok(message)) => {
-                let next_order_id = decoders::decode_next_valid_id(&message)?;
-
-                self.set_next_order_id(next_order_id);
-
-                Ok(next_order_id)
+                let server_order_id = decoders::decode_next_valid_id(&message)?;
+                Ok(self.reserve_order_id_at_least(server_order_id))
             }
             Some(Err(e)) => Err(e),
             None => Err(Error::UnexpectedEndOfStream),

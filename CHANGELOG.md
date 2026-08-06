@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Async snapshot market-data subscriptions no longer send a redundant cancel after the snapshot completes, matching the sync side (#686).
+- `Notice` now preserves the request or order ID decoded from TWS error frames, allowing consumers to associate broker rejections with the originating request.
+- The multiplexed order-update stream now surfaces broker errors for known order IDs as typed, nonterminal `Notice` values instead of silently dropping undecodable raw error frames, while an ID-origin registry prevents non-order request errors from leaking into order diagnostics.
+- Automatically allocated request and order IDs now share one monotonic sequence, preventing eventual collisions in TWS error routing; explicit cross-kind ID reuse fails before a packet is written.
+- Async socket writes and reconnect handshakes are now serialized and cancellation-safe; queued order ownership is committed only when its socket-write attempt begins.
 
 ## [3.1.0] - 2026-06-19
 

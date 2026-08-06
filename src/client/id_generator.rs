@@ -22,16 +22,6 @@ impl IdGenerator {
         }
     }
 
-    /// Creates a new ID generator for request IDs (starts at 9000)
-    pub(crate) fn new_request_id_generator() -> Self {
-        Self::new(INITIAL_REQUEST_ID)
-    }
-
-    /// Creates a new ID generator for order IDs with the server-provided starting value
-    pub(crate) fn new_order_id_generator(start: i32) -> Self {
-        Self::new(start)
-    }
-
     /// Gets the next ID, incrementing the internal counter
     pub(crate) fn next(&self) -> i32 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
@@ -48,6 +38,25 @@ impl IdGenerator {
         self.next_id.store(value, Ordering::Relaxed);
     }
 
+    /// Advances to at least `value` without reusing an ID already handed out.
+    #[cfg(test)]
+    pub(crate) fn advance_to(&self, value: i32) {
+        self.next_id.fetch_max(value, Ordering::Relaxed);
+    }
+
+    /// Atomically reserves and returns an ID at or above `floor`.
+    pub(crate) fn reserve_at_least(&self, floor: i32) -> i32 {
+        let mut observed = self.next_id.load(Ordering::Relaxed);
+        loop {
+            let reserved = observed.max(floor);
+            let next = reserved.checked_add(1).expect("IB API ID sequence exhausted i32");
+            match self.next_id.compare_exchange_weak(observed, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return reserved,
+                Err(actual) => observed = actual,
+            }
+        }
+    }
+
     /// Resets the generator to a new starting value
     #[allow(dead_code)]
     pub(crate) fn reset(&self, start: i32) {
@@ -61,47 +70,56 @@ impl Default for IdGenerator {
     }
 }
 
-/// Manages both request and order ID generation for a client
+/// Manages one collision-free request/order ID namespace for a client.
+///
+/// TWS Error frames carry only an integer ID, without identifying whether it
+/// came from a request or an order. Sharing the allocator prevents automatic
+/// IDs from becoming ambiguous as the server-provided order sequence grows.
 #[derive(Debug)]
 pub(crate) struct ClientIdManager {
-    request_ids: IdGenerator,
-    order_ids: IdGenerator,
+    ids: IdGenerator,
 }
 
 impl ClientIdManager {
-    /// Creates a new ID manager with the initial order ID from the server
+    /// Starts at the larger of the local request floor and the server's next
+    /// valid order ID.
     pub(crate) fn new(initial_order_id: i32) -> Self {
         Self {
-            request_ids: IdGenerator::new_request_id_generator(),
-            order_ids: IdGenerator::new_order_id_generator(initial_order_id),
+            ids: IdGenerator::new(INITIAL_REQUEST_ID.max(initial_order_id)),
         }
     }
 
     /// Gets the next request ID
     pub(crate) fn next_request_id(&self) -> i32 {
-        self.request_ids.next()
+        self.ids.next()
     }
 
     /// Gets the next order ID
     pub(crate) fn next_order_id(&self) -> i32 {
-        self.order_ids.next()
+        self.ids.next()
     }
 
     /// Updates the order ID (e.g., from server's next valid ID response)
+    #[cfg(test)]
     pub(crate) fn set_order_id(&self, order_id: i32) {
-        self.order_ids.set(order_id);
+        self.ids.advance_to(order_id);
+    }
+
+    /// Atomically reserves an order ID at or above the server-provided floor.
+    pub(crate) fn reserve_order_id_at_least(&self, order_id: i32) -> i32 {
+        self.ids.reserve_at_least(order_id)
     }
 
     /// Gets the current order ID without incrementing
     #[allow(dead_code)]
     pub(crate) fn current_order_id(&self) -> i32 {
-        self.order_ids.current()
+        self.ids.current()
     }
 
     /// Gets the current request ID without incrementing
     #[allow(dead_code)]
     pub(crate) fn current_request_id(&self) -> i32 {
-        self.request_ids.current()
+        self.ids.current()
     }
 }
 

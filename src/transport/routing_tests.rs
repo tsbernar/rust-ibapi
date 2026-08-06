@@ -30,6 +30,7 @@ fn test_notice_from_decoded_preserves_rich_payload() {
     };
     let notice = Notice::from(payload);
 
+    assert_eq!(notice.request_id, Some(42));
     assert_eq!(notice.code, 2104);
     assert_eq!(notice.message, "Market data farm OK");
     assert_eq!(notice.advanced_order_reject_json, "{\"reject\":1}");
@@ -51,6 +52,7 @@ fn test_notice_from_decoded_missing_optionals() {
     };
     let notice = Notice::from(payload);
 
+    assert_eq!(notice.request_id, None);
     assert_eq!(notice.code, 200);
     assert_eq!(notice.error_time, None);
     assert_eq!(notice.advanced_order_reject_json, "");
@@ -71,6 +73,7 @@ fn test_error_from_decoded_projects_to_notice() {
 
     match err {
         crate::Error::Notice(notice) => {
+            assert_eq!(notice.request_id, Some(42));
             assert_eq!(notice.code, 200);
             assert_eq!(notice.message, "no security");
         }

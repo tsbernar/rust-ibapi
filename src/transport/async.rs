@@ -4,13 +4,14 @@ mod io;
 pub(crate) use io::{AsyncStream, AsyncTcpSocket};
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::ops::Deref;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
 use futures::StreamExt;
 use log::{debug, error, info, warn};
-use tokio::sync::{broadcast, mpsc, Notify, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, Notify, RwLock};
 use tokio::task;
 use tokio::time::Duration;
 use tokio_stream::wrappers::BroadcastStream;
@@ -19,9 +20,10 @@ use crate::connection::r#async::AsyncConnection;
 use crate::messages::{shared_channel_configuration, IncomingMessages, Notice, OutgoingMessages, ResponseMessage};
 use crate::Error;
 
-use super::common::log_orphan;
+use super::common::{log_orphan, ErrorRouteOwners, IdOrigin, IdOwnerToken, OrderChannelToken, OwnedIdClaim};
 use super::routing::{
-    determine_routing, is_warning_error, order_routing_strategy, DecodedError, OrderRoutingStrategy, RoutingDecision, UNSPECIFIED_REQUEST_ID,
+    determine_routing, is_warning_error, order_routing_strategy, terminal_order_id, DecodedError, OrderRoutingStrategy, RoutingDecision,
+    UNSPECIFIED_REQUEST_ID,
 };
 use super::RoutedItem;
 
@@ -31,11 +33,13 @@ pub(crate) const BROADCAST_CHANNEL_CAPACITY: usize = 1024;
 
 /// Cleanup signal for removing channels when subscriptions are dropped
 #[derive(Debug, Clone)]
-pub enum CleanupSignal {
-    Request(i32),
-    Order(i32),
+pub(crate) enum CleanupSignal {
+    Request(IdOwnerToken),
+    Order(OrderChannelToken),
     Shared(OutgoingMessages),
     OrderUpdateStream,
+    #[cfg(test)]
+    Barrier(Arc<Notify>),
 }
 
 /// Asynchronous message bus trait
@@ -44,6 +48,8 @@ pub trait AsyncMessageBus: Send + Sync {
     async fn send_request(&self, request_id: i32, message: Vec<u8>) -> Result<AsyncInternalSubscription, Error>;
 
     async fn send_order_request(&self, order_id: i32, message: Vec<u8>) -> Result<AsyncInternalSubscription, Error>;
+
+    async fn send_order_message(&self, order_id: i32, message: Vec<u8>) -> Result<(), Error>;
 
     async fn send_shared_request(&self, message_type: OutgoingMessages, message: Vec<u8>) -> Result<AsyncInternalSubscription, Error>;
 
@@ -198,23 +204,83 @@ impl Drop for AsyncInternalSubscription {
 
 type BroadcastSender = broadcast::Sender<RoutedItem>;
 
+#[derive(Debug)]
+struct ChannelEntry {
+    generation: u64,
+    sender: BroadcastSender,
+}
+
+impl Deref for ChannelEntry {
+    type Target = BroadcastSender;
+
+    fn deref(&self) -> &Self::Target {
+        &self.sender
+    }
+}
+
+type ChannelMap = Arc<RwLock<HashMap<i32, ChannelEntry>>>;
+
+enum WriteCommand {
+    Message {
+        message: Vec<u8>,
+        epoch: u64,
+        order_claim: Option<OwnedIdClaim>,
+        result: oneshot::Sender<Result<(), Error>>,
+    },
+    Reconnect {
+        result: oneshot::Sender<Result<(), Error>>,
+        resume: oneshot::Receiver<()>,
+    },
+    Shutdown {
+        acknowledged: oneshot::Sender<()>,
+    },
+}
+
+async fn remove_channel_generation(channels: &RwLock<HashMap<i32, ChannelEntry>>, id: i32, generation: u64) {
+    let mut channels = channels.write().await;
+    if channels.get(&id).is_some_and(|entry| entry.generation == generation) {
+        channels.remove(&id);
+    }
+}
+
+async fn restore_channel_generation(channels: &RwLock<HashMap<i32, ChannelEntry>>, id: i32, failed_generation: u64, previous: Option<ChannelEntry>) {
+    let mut channels = channels.write().await;
+    if channels.get(&id).is_some_and(|entry| entry.generation == failed_generation) {
+        if let Some(previous) = previous {
+            channels.insert(id, previous);
+        } else {
+            channels.remove(&id);
+        }
+    }
+}
+
 /// Asynchronous TCP message bus implementation
 pub struct AsyncTcpMessageBus<S: AsyncStream = AsyncTcpSocket> {
     connection: Arc<AsyncConnection<S>>,
     /// Maps request IDs to their response channels
-    request_channels: Arc<RwLock<HashMap<i32, BroadcastSender>>>,
+    request_channels: ChannelMap,
     /// Maps IncomingMessages to broadcast senders (like sync does)
     shared_channel_senders: Arc<RwLock<HashMap<IncomingMessages, Vec<BroadcastSender>>>>,
     /// Maps OutgoingMessages to receivers for client subscription
     shared_channel_receivers: Arc<RwLock<HashMap<OutgoingMessages, broadcast::Receiver<RoutedItem>>>>,
     /// Maps order IDs to their response channels
-    order_channels: Arc<RwLock<HashMap<i32, BroadcastSender>>>,
+    order_channels: ChannelMap,
+    next_order_channel_generation: AtomicU64,
+    /// Rejects explicit cross-kind reuse of the ID shared by TWS request and
+    /// order error frames.
+    id_origins: Arc<ErrorRouteOwners>,
     /// Maps execution IDs to their response channels (for commission reports)
     execution_channels: Arc<RwLock<HashMap<String, BroadcastSender>>>,
     /// Optional channel for order update stream
     order_update_stream: Arc<RwLock<Option<BroadcastSender>>>,
     /// Channel for cleanup signals
     cleanup_sender: mpsc::UnboundedSender<CleanupSignal>,
+    /// Cancellation-safe serialized writer. Once a command is queued, dropping
+    /// the caller cannot cancel a partially emitted TWS frame.
+    write_sender: mpsc::UnboundedSender<WriteCommand>,
+    write_task: StdMutex<Option<task::JoinHandle<()>>>,
+    writer_shutdown_started: AtomicBool,
+    connection_epoch: Arc<AtomicU64>,
     /// Handle to the message processing task
     process_task: Arc<RwLock<Option<task::JoinHandle<()>>>>,
     /// Shutdown flag
@@ -229,7 +295,12 @@ impl<S: AsyncStream> Drop for AsyncTcpMessageBus<S> {
         debug!("dropping async tcp message bus");
         // Set the shutdown flag and notify the message loop to exit
         self.shutdown_requested.store(true, Ordering::Relaxed);
-        self.shutdown_notify.notify_waiters();
+        self.shutdown_notify.notify_one();
+        if let Ok(mut task) = self.write_task.lock() {
+            if let Some(task) = task.take() {
+                task.abort();
+            }
+        }
     }
 }
 
@@ -237,6 +308,7 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
     /// Create a new async TCP message bus
     pub fn new(connection: AsyncConnection<S>) -> Result<Self, Error> {
         let (cleanup_sender, cleanup_receiver) = mpsc::unbounded_channel();
+        let (write_sender, mut write_receiver) = mpsc::unbounded_channel();
 
         // Pre-create broadcast channels for all shared channels (like sync does)
         let mut shared_channel_senders = HashMap::new();
@@ -252,15 +324,76 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
             }
         }
 
+        let connection = Arc::new(connection);
+        let writer_connection = connection.clone();
+        let connection_epoch = Arc::new(AtomicU64::new(0));
+        let writer_epoch = connection_epoch.clone();
+        let write_task = task::spawn(async move {
+            while let Some(command) = write_receiver.recv().await {
+                match command {
+                    WriteCommand::Message {
+                        message,
+                        epoch,
+                        mut order_claim,
+                        result,
+                    } => {
+                        let write_result = if epoch == writer_epoch.load(Ordering::Acquire) {
+                            if let Some(claim) = order_claim.take() {
+                                claim.commit();
+                            }
+                            writer_connection.write_message(&message).await
+                        } else {
+                            drop(order_claim.take());
+                            Err(Error::ConnectionReset)
+                        };
+                        let _ = result.send(write_result);
+                    }
+                    WriteCommand::Reconnect { result, resume } => {
+                        let reconnect_result = writer_connection.reconnect().await;
+                        let reconnected = reconnect_result.is_ok();
+                        let _ = result.send(reconnect_result);
+                        if reconnected {
+                            let _ = resume.await;
+                        }
+                    }
+                    WriteCommand::Shutdown { acknowledged } => {
+                        write_receiver.close();
+                        while let Some(command) = write_receiver.recv().await {
+                            match command {
+                                WriteCommand::Message { order_claim, result, .. } => {
+                                    drop(order_claim);
+                                    let _ = result.send(Err(Error::Shutdown));
+                                }
+                                WriteCommand::Reconnect { result, .. } => {
+                                    let _ = result.send(Err(Error::Shutdown));
+                                }
+                                WriteCommand::Shutdown { acknowledged } => {
+                                    let _ = acknowledged.send(());
+                                }
+                            }
+                        }
+                        let _ = acknowledged.send(());
+                        break;
+                    }
+                }
+            }
+        });
+
         let message_bus = Self {
-            connection: Arc::new(connection),
+            connection,
             request_channels: Arc::new(RwLock::new(HashMap::new())),
             shared_channel_senders: Arc::new(RwLock::new(shared_channel_senders)),
             shared_channel_receivers: Arc::new(RwLock::new(shared_channel_receivers)),
             order_channels: Arc::new(RwLock::new(HashMap::new())),
+            next_order_channel_generation: AtomicU64::new(0),
+            id_origins: Arc::new(ErrorRouteOwners::default()),
             execution_channels: Arc::new(RwLock::new(HashMap::new())),
             order_update_stream: Arc::new(RwLock::new(None)),
             cleanup_sender,
+            write_sender,
+            write_task: StdMutex::new(Some(write_task)),
+            writer_shutdown_started: AtomicBool::new(false),
+            connection_epoch,
             process_task: Arc::new(RwLock::new(None)),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
@@ -270,20 +403,22 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
         // Start cleanup task
         let request_channels = message_bus.request_channels.clone();
         let order_channels = message_bus.order_channels.clone();
+        let id_origins = message_bus.id_origins.clone();
         let order_update_stream = message_bus.order_update_stream.clone();
 
         task::spawn(async move {
             let mut receiver = cleanup_receiver;
             while let Some(signal) = receiver.recv().await {
                 match signal {
-                    CleanupSignal::Request(request_id) => {
-                        let mut channels = request_channels.write().await;
-                        channels.remove(&request_id);
+                    CleanupSignal::Request(request_owner) => {
+                        let request_id = request_owner.id;
+                        remove_channel_generation(&request_channels, request_id, request_owner.generation).await;
+                        id_origins.release_request(request_owner);
                         debug!("Cleaned up request channel for ID: {request_id}");
                     }
-                    CleanupSignal::Order(order_id) => {
-                        let mut channels = order_channels.write().await;
-                        channels.remove(&order_id);
+                    CleanupSignal::Order(order_channel) => {
+                        let order_id = order_channel.id;
+                        remove_channel_generation(&order_channels, order_id, order_channel.generation).await;
                         debug!("Cleaned up order channel for ID: {order_id}");
                     }
                     CleanupSignal::Shared(message_type) => {
@@ -296,11 +431,106 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
                         *stream = None;
                         debug!("Cleaned up order update stream ownership");
                     }
+                    #[cfg(test)]
+                    CleanupSignal::Barrier(acknowledge) => acknowledge.notify_one(),
                 }
             }
         });
 
         Ok(message_bus)
+    }
+
+    fn begin_write(&self) -> Result<u64, Error> {
+        if self.shutdown_requested.load(Ordering::Relaxed) {
+            return Err(Error::Shutdown);
+        }
+        let epoch = self.connection_epoch.load(Ordering::Acquire);
+        if !self.connected.load(Ordering::Acquire) {
+            return Err(Error::ConnectionReset);
+        }
+        if self.connection_epoch.load(Ordering::Acquire) != epoch {
+            return Err(Error::ConnectionReset);
+        }
+        Ok(epoch)
+    }
+
+    fn enqueue_write_message(&self, message: Vec<u8>, epoch: u64) -> Result<oneshot::Receiver<Result<(), Error>>, Error> {
+        self.enqueue_write_command(message, epoch, None)
+    }
+
+    fn enqueue_order_write_message(
+        &self,
+        message: Vec<u8>,
+        epoch: u64,
+        order_claim: OwnedIdClaim,
+    ) -> Result<oneshot::Receiver<Result<(), Error>>, Error> {
+        self.enqueue_write_command(message, epoch, Some(order_claim))
+    }
+
+    fn enqueue_write_command(
+        &self,
+        message: Vec<u8>,
+        epoch: u64,
+        order_claim: Option<OwnedIdClaim>,
+    ) -> Result<oneshot::Receiver<Result<(), Error>>, Error> {
+        if self.shutdown_requested.load(Ordering::Relaxed) {
+            return Err(Error::Shutdown);
+        }
+        if !self.connected.load(Ordering::Acquire) || self.connection_epoch.load(Ordering::Acquire) != epoch {
+            return Err(Error::ConnectionReset);
+        }
+        let (result, receiver) = oneshot::channel();
+        self.write_sender
+            .send(WriteCommand::Message {
+                message,
+                epoch,
+                order_claim,
+                result,
+            })
+            .map_err(|_| Error::ConnectionFailed)?;
+        Ok(receiver)
+    }
+
+    async fn finish_write_message(write: oneshot::Receiver<Result<(), Error>>) -> Result<(), Error> {
+        write
+            .await
+            .map_err(|_| Error::Simple("async writer stopped before reporting a result".into()))?
+    }
+
+    async fn shutdown_writer(&self) {
+        if !self.writer_shutdown_started.swap(true, Ordering::AcqRel) {
+            let (acknowledged, acknowledgement) = oneshot::channel();
+            if self.write_sender.send(WriteCommand::Shutdown { acknowledged }).is_ok() {
+                let _ = acknowledgement.await;
+            }
+        }
+        let task = self.write_task.lock().ok().and_then(|mut task| task.take());
+        if let Some(task) = task {
+            let _ = task.await;
+        }
+    }
+
+    async fn reconnect_and_reset(&self) -> Result<(), Error> {
+        self.connected.store(false, Ordering::Release);
+        self.connection_epoch.fetch_add(1, Ordering::AcqRel);
+
+        let (result, reconnect_result) = oneshot::channel();
+        let (resume, resume_writer) = oneshot::channel();
+        self.write_sender
+            .send(WriteCommand::Reconnect {
+                result,
+                resume: resume_writer,
+            })
+            .map_err(|_| Error::ConnectionFailed)?;
+
+        reconnect_result
+            .await
+            .map_err(|_| Error::Simple("async writer stopped before reporting reconnect result".into()))??;
+
+        self.reset_channels().await;
+        resume.send(()).map_err(|_| Error::ConnectionFailed)?;
+        self.connected.store(true, Ordering::Release);
+        Ok(())
     }
 
     /// Start processing messages from TWS
@@ -332,13 +562,9 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
                             }
                             Err(ref err) if is_connection_error(err) => {
                                 error!("Connection error detected, attempting to reconnect: {err:?}");
-                                message_bus.connected.store(false, Ordering::Relaxed);
-
-                                match message_bus.connection.reconnect().await {
+                                match message_bus.reconnect_and_reset().await {
                                     Ok(_) => {
                                         info!("Successfully reconnected to TWS/Gateway");
-                                        message_bus.connected.store(true, Ordering::Relaxed);
-                                        message_bus.reset_channels().await;
                                     }
                                     Err(e) => {
                                         error!("Failed to reconnect to TWS/Gateway: {e:?}");
@@ -424,6 +650,8 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
             let mut channels = self.execution_channels.write().await;
             channels.clear();
         }
+
+        self.id_origins.clear_requests();
     }
 
     /// Notify all waiting subscriptions about shutdown
@@ -433,7 +661,8 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
         // Set the shutdown flag and mark as disconnected
         self.connected.store(false, Ordering::Relaxed);
         self.shutdown_requested.store(true, Ordering::Relaxed);
-        self.shutdown_notify.notify_waiters();
+        self.shutdown_notify.notify_one();
+        self.shutdown_writer().await;
 
         // Clear all channels - dropping the senders will close the channels
         // and cause all receivers to get RecvError::Closed
@@ -446,6 +675,8 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
             let mut channels = self.order_channels.write().await;
             channels.clear();
         }
+
+        self.id_origins.clear();
 
         {
             let mut channels = self.shared_channel_senders.write().await;
@@ -464,48 +695,46 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
     }
 
     /// Route error message using routing decision
-    async fn route_error_message(&self, message: ResponseMessage, payload: DecodedError) -> Result<(), Error> {
-        let sent_to_update_stream = self.send_order_update(&message).await;
+    async fn route_error_message(&self, _message: ResponseMessage, payload: DecodedError) -> Result<(), Error> {
         let request_id = payload.request_id;
         let is_warning = is_warning_error(payload.error_code);
+        let notice = Notice::from(payload);
 
         if request_id == UNSPECIFIED_REQUEST_ID {
-            let notice = Notice::from(payload);
             super::common::log_unrouted_notice(&notice);
             let _ = self.connection.notice_sender.send(notice);
         } else {
             let item = if is_warning {
-                RoutedItem::Notice(Notice::from(payload))
+                RoutedItem::Notice(notice.clone())
             } else {
-                RoutedItem::Error(Error::from(payload))
+                RoutedItem::Error(Error::Notice(notice.clone()))
             };
-            self.deliver_to_request_id(request_id, item, sent_to_update_stream).await;
+            match self.id_origins.origin(request_id) {
+                Some(IdOrigin::Request) => {
+                    let channels = self.request_channels.read().await;
+                    if let Some(sender) = channels.get(&request_id) {
+                        let _ = sender.send(item);
+                    } else {
+                        log_orphan(request_id, &item);
+                    }
+                }
+                Some(IdOrigin::Order) => {
+                    // A multiplexed stream must remain alive after one order is
+                    // rejected, so its copy is a nonterminal Notice while an
+                    // order-specific stream retains the terminal Error.
+                    let sent_to_update_stream = self.send_order_update_item(RoutedItem::Notice(notice)).await;
+                    let channels = self.order_channels.read().await;
+                    if let Some(sender) = channels.get(&request_id) {
+                        let _ = sender.send(item);
+                    } else if !sent_to_update_stream {
+                        log_orphan(request_id, &item);
+                    }
+                }
+                None => log_orphan(request_id, &item),
+            }
         }
 
         Ok(())
-    }
-
-    /// Deliver a pre-classified Notice or Error to its owning subscription.
-    /// Tries the request-channel first, falls back to the order-channel for
-    /// notices/errors that arrive bound to an order_id.
-    async fn deliver_to_request_id(&self, request_id: i32, item: RoutedItem, sent_to_update_stream: bool) {
-        {
-            let channels = self.request_channels.read().await;
-            if let Some(sender) = channels.get(&request_id) {
-                let _ = sender.send(item);
-                return;
-            }
-        }
-        {
-            let order_channels = self.order_channels.read().await;
-            if let Some(sender) = order_channels.get(&request_id) {
-                let _ = sender.send(item);
-                return;
-            }
-        }
-        if !sent_to_update_stream {
-            log_orphan(request_id, &item);
-        }
     }
 
     /// Route message to request-specific channel
@@ -519,6 +748,9 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
 
     /// Route message to order-specific channel
     async fn route_to_order_channel(&self, order_id: i32, message: ResponseMessage) -> Result<(), Error> {
+        if let Some(terminal_id) = terminal_order_id(&message) {
+            self.id_origins.mark_order_terminal(terminal_id);
+        }
         let routed = self.send_order_update(&message).await;
         let strategy = order_routing_strategy(message.message_type());
 
@@ -659,9 +891,14 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
 
     /// Send message to order update stream if it exists
     async fn send_order_update(&self, message: &ResponseMessage) -> bool {
+        self.send_order_update_item(message.clone().into()).await
+    }
+
+    /// Send a pre-classified item to the order update stream if it exists.
+    async fn send_order_update_item(&self, item: RoutedItem) -> bool {
         let order_update_stream = self.order_update_stream.read().await;
         if let Some(sender) = order_update_stream.as_ref() {
-            if let Err(e) = sender.send(message.clone().into()) {
+            if let Err(e) = sender.send(item) {
                 warn!("error sending to order update stream: {e}");
                 return false;
             }
@@ -674,40 +911,87 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
 #[async_trait]
 impl<S: AsyncStream> AsyncMessageBus for AsyncTcpMessageBus<S> {
     async fn send_request(&self, request_id: i32, message: Vec<u8>) -> Result<AsyncInternalSubscription, Error> {
+        let epoch = self.begin_write()?;
+        let claim = self.id_origins.claim_request(request_id)?;
+        let request_owner = claim.token();
         let (sender, receiver) = broadcast::channel(BROADCAST_CHANNEL_CAPACITY);
 
-        {
+        let previous_channel = {
             let mut channels = self.request_channels.write().await;
-            channels.insert(request_id, sender);
+            channels.insert(
+                request_id,
+                ChannelEntry {
+                    generation: request_owner.generation,
+                    sender,
+                },
+            )
+        };
+
+        let write = match self.enqueue_write_message(message, epoch) {
+            Ok(write) => write,
+            Err(error) => {
+                restore_channel_generation(&self.request_channels, request_id, request_owner.generation, previous_channel).await;
+                return Err(error);
+            }
+        };
+        claim.commit();
+        let subscription = AsyncInternalSubscription::with_cleanup(receiver, self.cleanup_sender.clone(), CleanupSignal::Request(request_owner));
+
+        if let Err(error) = Self::finish_write_message(write).await {
+            restore_channel_generation(&self.request_channels, request_id, request_owner.generation, previous_channel).await;
+            self.id_origins.release_request(request_owner);
+            return Err(error);
         }
 
-        self.connection.write_message(&message).await?;
-
-        Ok(AsyncInternalSubscription::with_cleanup(
-            receiver,
-            self.cleanup_sender.clone(),
-            CleanupSignal::Request(request_id),
-        ))
+        Ok(subscription)
     }
 
     async fn send_order_request(&self, order_id: i32, message: Vec<u8>) -> Result<AsyncInternalSubscription, Error> {
+        let epoch = self.begin_write()?;
+        let claim = self.id_origins.claim_order(order_id)?.into_owned(self.id_origins.clone());
+        let order_channel = OrderChannelToken {
+            id: order_id,
+            generation: self.next_order_channel_generation.fetch_add(1, Ordering::Relaxed),
+        };
         let (sender, receiver) = broadcast::channel(BROADCAST_CHANNEL_CAPACITY);
 
-        {
+        let previous_channel = {
             let mut channels = self.order_channels.write().await;
-            channels.insert(order_id, sender);
+            channels.insert(
+                order_id,
+                ChannelEntry {
+                    generation: order_channel.generation,
+                    sender,
+                },
+            )
+        };
+
+        let write = match self.enqueue_order_write_message(message, epoch, claim) {
+            Ok(write) => write,
+            Err(error) => {
+                restore_channel_generation(&self.order_channels, order_id, order_channel.generation, previous_channel).await;
+                return Err(error);
+            }
+        };
+        let subscription = AsyncInternalSubscription::with_cleanup(receiver, self.cleanup_sender.clone(), CleanupSignal::Order(order_channel));
+
+        if let Err(error) = Self::finish_write_message(write).await {
+            restore_channel_generation(&self.order_channels, order_id, order_channel.generation, previous_channel).await;
+            return Err(error);
         }
 
-        self.connection.write_message(&message).await?;
+        Ok(subscription)
+    }
 
-        Ok(AsyncInternalSubscription::with_cleanup(
-            receiver,
-            self.cleanup_sender.clone(),
-            CleanupSignal::Order(order_id),
-        ))
+    async fn send_order_message(&self, order_id: i32, message: Vec<u8>) -> Result<(), Error> {
+        let epoch = self.begin_write()?;
+        let claim = self.id_origins.claim_order(order_id)?.into_owned(self.id_origins.clone());
+        let write = self.enqueue_order_write_message(message, epoch, claim)?;
+        Self::finish_write_message(write).await
     }
 
     async fn send_shared_request(&self, message_type: OutgoingMessages, message: Vec<u8>) -> Result<AsyncInternalSubscription, Error> {
+        let epoch = self.begin_write()?;
         let receiver = {
             let channels = self.shared_channel_receivers.read().await;
             if let Some(receiver) = channels.get(&message_type) {
@@ -720,7 +1004,8 @@ impl<S: AsyncStream> AsyncMessageBus for AsyncTcpMessageBus<S> {
             }
         };
 
-        self.connection.write_message(&message).await?;
+        let write = self.enqueue_write_message(message, epoch)?;
+        Self::finish_write_message(write).await?;
 
         Ok(AsyncInternalSubscription::with_cleanup(
             receiver,
@@ -730,11 +1015,15 @@ impl<S: AsyncStream> AsyncMessageBus for AsyncTcpMessageBus<S> {
     }
 
     async fn send_message(&self, message: Vec<u8>) -> Result<(), Error> {
-        self.connection.write_message(&message).await
+        let epoch = self.begin_write()?;
+        let write = self.enqueue_write_message(message, epoch)?;
+        Self::finish_write_message(write).await
     }
 
     async fn cancel_subscription(&self, request_id: i32, message: Vec<u8>) -> Result<(), Error> {
-        self.connection.write_message(&message).await?;
+        let epoch = self.begin_write()?;
+        let write = self.enqueue_write_message(message, epoch)?;
+        Self::finish_write_message(write).await?;
 
         // Single write lock: the previous version held a read guard while
         // awaiting the write upgrade and self-deadlocked on the same task.
@@ -743,12 +1032,16 @@ impl<S: AsyncStream> AsyncMessageBus for AsyncTcpMessageBus<S> {
             let _ = sender.send(Error::Cancelled.into());
         }
         channels.remove(&request_id);
+        drop(channels);
+        self.id_origins.release_request_id(request_id);
 
         Ok(())
     }
 
     async fn cancel_order_subscription(&self, order_id: i32, message: Vec<u8>) -> Result<(), Error> {
-        self.connection.write_message(&message).await?;
+        let epoch = self.begin_write()?;
+        let write = self.enqueue_write_message(message, epoch)?;
+        Self::finish_write_message(write).await?;
 
         let mut channels = self.order_channels.write().await;
         if let Some(sender) = channels.get(&order_id) {
@@ -806,7 +1099,7 @@ impl<S: AsyncStream> AsyncMessageBus for AsyncTcpMessageBus<S> {
         debug!("sync shutdown requested");
         self.connected.store(false, Ordering::Relaxed);
         self.shutdown_requested.store(true, Ordering::Relaxed);
-        self.shutdown_notify.notify_waiters();
+        self.shutdown_notify.notify_one();
     }
 
     fn is_connected(&self) -> bool {

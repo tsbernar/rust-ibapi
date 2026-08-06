@@ -32,8 +32,8 @@ fn accessors_round_trip() {
     client.set_next_order_id(9000);
     let o1 = client.next_order_id();
     let o2 = client.next_order_id();
-    assert_eq!(o1, 9000);
-    assert_eq!(o2, 9001);
+    assert_eq!(o1, r2 + 1);
+    assert_eq!(o2, r2 + 2);
 }
 
 #[test]

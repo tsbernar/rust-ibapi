@@ -21,6 +21,7 @@ struct Inner {
     closed: bool,
     /// Remaining `reconnect()` calls that should fail before one succeeds.
     reconnect_failures: usize,
+    block_next_write: bool,
 }
 
 /// In-memory async stream. Cloning yields another handle to the same shared queues.
@@ -28,6 +29,8 @@ struct Inner {
 pub(crate) struct MemoryStream {
     inner: Arc<Mutex<Inner>>,
     notify: Arc<Notify>,
+    write_started: Arc<Notify>,
+    write_release: Arc<Notify>,
 }
 
 impl MemoryStream {
@@ -53,6 +56,18 @@ impl MemoryStream {
     /// `Error::Simple`; subsequent calls succeed.
     pub fn set_reconnect_failures(&self, count: usize) {
         self.inner.lock().unwrap().reconnect_failures = count;
+    }
+
+    pub fn block_next_write(&self) {
+        self.inner.lock().unwrap().block_next_write = true;
+    }
+
+    pub async fn wait_for_write_started(&self) {
+        self.write_started.notified().await;
+    }
+
+    pub fn release_write(&self) {
+        self.write_release.notify_one();
     }
 }
 
@@ -87,7 +102,15 @@ impl AsyncIo for MemoryStream {
     }
 
     async fn write_all(&self, buf: &[u8]) -> Result<(), Error> {
-        self.inner.lock().unwrap().outbound.extend_from_slice(buf);
+        let should_block = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.outbound.extend_from_slice(buf);
+            std::mem::take(&mut inner.block_next_write)
+        };
+        if should_block {
+            self.write_started.notify_one();
+            self.write_release.notified().await;
+        }
         Ok(())
     }
 }

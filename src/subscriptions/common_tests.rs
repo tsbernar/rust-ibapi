@@ -55,6 +55,7 @@ fn test_filter_notice() {
     }
 
     let notice = Notice {
+        request_id: None,
         code: 2104,
         message: "Market data farm OK".into(),
         error_time: None,

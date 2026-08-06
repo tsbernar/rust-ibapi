@@ -268,8 +268,13 @@ impl Client {
     }
 
     /// Sets the current value of order ID.
+    #[cfg(test)]
     pub(crate) fn set_next_order_id(&self, order_id: i32) {
         self.id_manager.set_order_id(order_id);
+    }
+
+    pub(crate) fn reserve_order_id_at_least(&self, order_id: i32) -> i32 {
+        self.id_manager.reserve_order_id_at_least(order_id)
     }
 
     /// Start building an order for the given contract
@@ -320,6 +325,10 @@ impl Client {
 
     pub(crate) async fn send_order(&self, order_id: i32, message: Vec<u8>) -> Result<AsyncInternalSubscription, Error> {
         self.message_bus.send_order_request(order_id, message).await
+    }
+
+    pub(crate) async fn send_order_message(&self, order_id: i32, message: Vec<u8>) -> Result<(), Error> {
+        self.message_bus.send_order_message(order_id, message).await
     }
 
     /// Create order update subscription

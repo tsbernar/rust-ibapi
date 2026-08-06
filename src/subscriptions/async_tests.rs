@@ -131,6 +131,7 @@ async fn test_routed_item_notice_skipped_then_response_delivered() {
     // contract is that notices are silently consumed and the next item is
     // delivered. Lock that contract before PR 3 starts emitting them.
     tx.send(RoutedItem::Notice(Notice {
+        request_id: None,
         code: 2104,
         message: "Market data farm OK".into(),
         error_time: None,
@@ -468,6 +469,7 @@ async fn test_data_stream_filters_notices() {
     );
 
     tx.send(RoutedItem::Notice(Notice {
+        request_id: None,
         code: 2104,
         message: "Market data farm OK".into(),
         error_time: None,
@@ -500,6 +502,7 @@ async fn test_routed_item_notice_surfaces_as_subscription_item() {
     );
 
     tx.send(RoutedItem::Notice(Notice {
+        request_id: None,
         code: 2104,
         message: "Market data farm OK".into(),
         error_time: None,
@@ -592,6 +595,7 @@ async fn filter_data_stream_drops_notices() {
 
     tx.send(RoutedItem::Response(ResponseMessage::from("11\0"))).unwrap();
     tx.send(RoutedItem::Notice(Notice {
+        request_id: None,
         code: 2104,
         message: "data farm OK".into(),
         error_time: None,
@@ -716,6 +720,7 @@ async fn test_collect_for_drains_to_stream_end() {
 #[tokio::test]
 async fn test_collect_for_filters_notices() {
     let notice = RoutedItem::Notice(Notice {
+        request_id: None,
         code: 2104,
         message: "Market data farm OK".into(),
         error_time: None,

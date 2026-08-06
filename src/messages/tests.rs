@@ -921,6 +921,7 @@ fn test_notice_edge_cases() {
 fn test_notice_is_cancellation() {
     // Code 202 = order cancelled
     let cancellation = Notice {
+        request_id: None,
         code: 202,
         message: "Order Cancelled - reason:".to_string(),
         error_time: None,
@@ -934,6 +935,7 @@ fn test_notice_is_cancellation() {
 
     // Other codes are not cancellations
     let error = Notice {
+        request_id: None,
         code: 200,
         message: "No security definition found".to_string(),
         error_time: None,
@@ -948,6 +950,7 @@ fn test_notice_is_warning() {
     let warning_codes = [2100, 2107, 2119, 2150, 2169];
     for code in warning_codes {
         let notice = Notice {
+            request_id: None,
             code,
             message: format!("Warning with code {}", code),
             error_time: None,
@@ -964,6 +967,7 @@ fn test_notice_is_warning() {
     let non_warning_codes = [2099, 2170, 200, 202, 1000];
     for code in non_warning_codes {
         let notice = Notice {
+            request_id: None,
             code,
             message: format!("Non-warning with code {}", code),
             error_time: None,
@@ -984,6 +988,7 @@ fn test_notice_is_system_message() {
     ];
     for (code, msg) in system_codes {
         let notice = Notice {
+            request_id: None,
             code,
             message: msg.to_string(),
             error_time: None,
@@ -1000,6 +1005,7 @@ fn test_notice_is_system_message() {
     let non_system_codes = [200, 202, 1099, 1103, 1299, 1301, 2100];
     for code in non_system_codes {
         let notice = Notice {
+            request_id: None,
             code,
             message: format!("Non-system message with code {}", code),
             error_time: None,
@@ -1015,6 +1021,7 @@ fn test_notice_is_informational() {
     let informational_codes = [202, 1100, 1101, 1102, 1300, 2100, 2107, 2169];
     for code in informational_codes {
         let notice = Notice {
+            request_id: None,
             code,
             message: format!("Informational code {}", code),
             error_time: None,
@@ -1028,6 +1035,7 @@ fn test_notice_is_informational() {
     let error_codes = [100, 200, 201, 321, 502, 10000];
     for code in error_codes {
         let notice = Notice {
+            request_id: None,
             code,
             message: format!("Error code {}", code),
             error_time: None,
@@ -1042,6 +1050,7 @@ fn test_notice_is_informational() {
 fn test_notice_is_error() {
     // Code 200 = actual error
     let error = Notice {
+        request_id: None,
         code: 200,
         message: "No security definition found".to_string(),
         error_time: None,
@@ -1052,6 +1061,7 @@ fn test_notice_is_error() {
 
     // Code 202 = cancellation, not error
     let cancellation = Notice {
+        request_id: None,
         code: 202,
         message: "Order Cancelled".to_string(),
         error_time: None,
@@ -1062,6 +1072,7 @@ fn test_notice_is_error() {
 
     // Code 1100 = system message, not error
     let system_msg = Notice {
+        request_id: None,
         code: 1100,
         message: "Connectivity lost".to_string(),
         error_time: None,
@@ -1072,6 +1083,7 @@ fn test_notice_is_error() {
 
     // Code 2107 = warning, not error
     let warning = Notice {
+        request_id: None,
         code: 2107,
         message: "HMDS data farm connection is inactive.".to_string(),
         error_time: None,
@@ -1083,6 +1095,7 @@ fn test_notice_is_error() {
 
 fn notice_with_code(code: i32) -> Notice {
     Notice {
+        request_id: None,
         code,
         message: String::new(),
         error_time: None,
