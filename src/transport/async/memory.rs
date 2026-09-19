@@ -22,6 +22,7 @@ struct Inner {
     /// Remaining `reconnect()` calls that should fail before one succeeds.
     reconnect_failures: usize,
     block_next_write: bool,
+    partial_write: bool,
 }
 
 /// In-memory async stream. Cloning yields another handle to the same shared queues.
@@ -60,6 +61,12 @@ impl MemoryStream {
 
     pub fn block_next_write(&self) {
         self.inner.lock().unwrap().block_next_write = true;
+    }
+
+    pub fn block_next_partial_write(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.block_next_write = true;
+        inner.partial_write = true;
     }
 
     pub async fn wait_for_write_started(&self) {
@@ -102,15 +109,21 @@ impl AsyncIo for MemoryStream {
     }
 
     async fn write_all(&self, buf: &[u8]) -> Result<(), Error> {
-        let should_block = {
+        let (should_block, written) = {
             let mut inner = self.inner.lock().unwrap();
-            inner.outbound.extend_from_slice(buf);
-            std::mem::take(&mut inner.block_next_write)
+            let written = if std::mem::take(&mut inner.partial_write) {
+                buf.len() / 2
+            } else {
+                buf.len()
+            };
+            inner.outbound.extend_from_slice(&buf[..written]);
+            (std::mem::take(&mut inner.block_next_write), written)
         };
         if should_block {
             self.write_started.notify_one();
             self.write_release.notified().await;
         }
+        self.inner.lock().unwrap().outbound.extend_from_slice(&buf[written..]);
         Ok(())
     }
 }

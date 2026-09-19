@@ -136,6 +136,9 @@ async fn test_wsh_event_data_by_filter_subscription_table() {
             match result {
                 Ok(SubscriptionItem::Data(event)) => received_events.push(event.data_json),
                 Ok(SubscriptionItem::Notice(_)) => continue,
+                // These stub fixtures close the transport after the listed events;
+                // that is now surfaced distinctly from a broker end marker.
+                Err(Error::UnexpectedEndOfStream) => break,
                 Err(e) => panic!("Test '{}' unexpected error: {e:?}", test_case.name),
             }
         }
@@ -316,6 +319,9 @@ async fn test_subscription_integration_table() {
             match event_result {
                 Ok(SubscriptionItem::Data(event)) => events.push(event.data_json),
                 Ok(SubscriptionItem::Notice(_)) => continue,
+                // These stub fixtures close the transport after the listed events;
+                // that is now surfaced distinctly from a broker end marker.
+                Err(Error::UnexpectedEndOfStream) => break,
                 Err(e) => panic!("Test '{}' unexpected error: {e:?}", test_case.name),
             }
         }

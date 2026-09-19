@@ -671,3 +671,28 @@ async fn test_verify_message_version_error() {
     assert!(matches!(result, Err(Error::ServerVersion(_, _, _))), "got {result:?}");
     assert_eq!(request_message_count(&message_bus), 0);
 }
+
+#[tokio::test]
+async fn dropping_old_position_refresh_cancels_only_its_request_id() {
+    let bus = Arc::new(MessageBusStub::default());
+    let client = Client::stubbed(bus.clone(), server_versions::SIZE_RULES);
+    let account = AccountId(TEST_ACCOUNT.into());
+    let old = client.positions_multi(Some(&account), None).await.unwrap();
+    let replacement = client.positions_multi(Some(&account), None).await.unwrap();
+    drop(old);
+    for _ in 0..10 {
+        if request_message_count(&bus) == 3 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(request_message_count(&bus), 3);
+    assert_request(&bus, 0, &request_positions_multi().request_id(TEST_REQ_ID_FIRST).account(TEST_ACCOUNT));
+    assert_request(
+        &bus,
+        1,
+        &request_positions_multi().request_id(TEST_REQ_ID_FIRST + 1).account(TEST_ACCOUNT),
+    );
+    assert_request(&bus, 2, &cancel_positions_multi().request_id(TEST_REQ_ID_FIRST));
+    drop(replacement);
+}

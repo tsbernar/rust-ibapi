@@ -98,6 +98,10 @@ pub enum Error {
     #[error("UnexpectedResponse: {0}")]
     UnexpectedResponse(String),
 
+    /// Messages were lost from the subscription broadcast buffer.
+    #[error("subscription lagged, lost {0} messages")]
+    SubscriptionLagged(u64),
+
     /// Stream ended unexpectedly.
     #[error("UnexpectedEndOfStream")]
     UnexpectedEndOfStream,
@@ -258,6 +262,7 @@ impl Clone for Error {
             Error::EndOfStream => Error::EndOfStream,
             Error::UnexpectedResponse(m) => Error::UnexpectedResponse(m.clone()),
             Error::UnexpectedEndOfStream => Error::UnexpectedEndOfStream,
+            Error::SubscriptionLagged(n) => Error::SubscriptionLagged(*n),
             Error::Notice(n) => Error::Notice(n.clone()),
             Error::AlreadySubscribed => Error::AlreadySubscribed,
             Error::HistoricalParseError(e) => Error::HistoricalParseError(e.clone()),

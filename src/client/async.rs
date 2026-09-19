@@ -181,7 +181,8 @@ impl Client {
     /// Cleanly shuts down the message bus.
     ///
     /// All outstanding [`Subscription`](crate::subscriptions::Subscription)s see their channels
-    /// close and their `next()` calls return `None`. The background dispatch task is awaited
+    /// close; decoder-backed streams report `UnexpectedEndOfStream` unless they
+    /// already consumed a broker end marker. The background dispatch task is awaited
     /// to completion before this returns.
     ///
     /// **Call this before dropping the final `Arc<Client>` if any spawned

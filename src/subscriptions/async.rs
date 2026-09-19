@@ -360,8 +360,14 @@ impl<T: Send + 'static> Stream for Subscription<T> {
                     // executor between immediately-available items.
                     let routed = match Pin::new(&mut subscription.stream).poll_next(cx) {
                         Poll::Ready(Some(Ok(item))) => item,
-                        Poll::Ready(Some(Err(_lagged))) => continue, // skip BroadcastStream lag
-                        Poll::Ready(None) => return Poll::Ready(None),
+                        Poll::Ready(Some(Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)))) => {
+                            stream_ended.store(true, Ordering::Relaxed);
+                            return Poll::Ready(Some(Err(Error::SubscriptionLagged(n))));
+                        }
+                        Poll::Ready(None) => {
+                            stream_ended.store(true, Ordering::Relaxed);
+                            return Poll::Ready(Some(Err(Error::UnexpectedEndOfStream)));
+                        }
                         Poll::Pending => return Poll::Pending,
                     };
 

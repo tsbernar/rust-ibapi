@@ -6,12 +6,12 @@ pub(crate) use io::{AsyncStream, AsyncTcpSocket};
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::StreamExt;
 use log::{debug, error, info, warn};
-use tokio::sync::{broadcast, mpsc, oneshot, Notify, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, Notify, RwLock};
 use tokio::task;
 use tokio::time::Duration;
 use tokio_stream::wrappers::BroadcastStream;
@@ -30,6 +30,7 @@ use super::RoutedItem;
 /// Default capacity for broadcast channels
 /// This should be large enough to handle bursts of messages without lagging
 pub(crate) const BROADCAST_CHANNEL_CAPACITY: usize = 1024;
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Cleanup signal for removing channels when subscriptions are dropped
 #[derive(Debug, Clone)]
@@ -151,7 +152,7 @@ impl AsyncInternalSubscription {
                         return Some(legacy);
                     }
                 }
-                Err(_lagged) => continue,
+                Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => return Some(Err(Error::SubscriptionLagged(n))),
             }
         }
     }
@@ -231,9 +232,6 @@ enum WriteCommand {
         result: oneshot::Sender<Result<(), Error>>,
         resume: oneshot::Receiver<()>,
     },
-    Shutdown {
-        acknowledged: oneshot::Sender<()>,
-    },
 }
 
 async fn remove_channel_generation(channels: &RwLock<HashMap<i32, ChannelEntry>>, id: i32, generation: u64) {
@@ -278,8 +276,7 @@ pub struct AsyncTcpMessageBus<S: AsyncStream = AsyncTcpSocket> {
     /// Cancellation-safe serialized writer. Once a command is queued, dropping
     /// the caller cannot cancel a partially emitted TWS frame.
     write_sender: mpsc::UnboundedSender<WriteCommand>,
-    write_task: StdMutex<Option<task::JoinHandle<()>>>,
-    writer_shutdown_started: AtomicBool,
+    write_task: Mutex<Option<task::JoinHandle<()>>>,
     connection_epoch: Arc<AtomicU64>,
     /// Handle to the message processing task
     process_task: Arc<RwLock<Option<task::JoinHandle<()>>>>,
@@ -296,10 +293,8 @@ impl<S: AsyncStream> Drop for AsyncTcpMessageBus<S> {
         // Set the shutdown flag and notify the message loop to exit
         self.shutdown_requested.store(true, Ordering::Relaxed);
         self.shutdown_notify.notify_one();
-        if let Ok(mut task) = self.write_task.lock() {
-            if let Some(task) = task.take() {
-                task.abort();
-            }
+        if let Some(task) = self.write_task.get_mut().take() {
+            task.abort();
         }
     }
 }
@@ -328,6 +323,12 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
         let writer_connection = connection.clone();
         let connection_epoch = Arc::new(AtomicU64::new(0));
         let writer_epoch = connection_epoch.clone();
+        let connected = Arc::new(AtomicBool::new(true));
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let shutdown_notify = Arc::new(Notify::new());
+        let writer_connected = connected.clone();
+        let writer_shutdown = shutdown_requested.clone();
+        let writer_notify = shutdown_notify.clone();
         let write_task = task::spawn(async move {
             while let Some(command) = write_receiver.recv().await {
                 match command {
@@ -337,43 +338,44 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
                         mut order_claim,
                         result,
                     } => {
-                        let write_result = if epoch == writer_epoch.load(Ordering::Acquire) {
+                        let stale = epoch != writer_epoch.load(Ordering::Acquire);
+                        let write_result = if !stale {
                             if let Some(claim) = order_claim.take() {
                                 claim.commit();
                             }
-                            writer_connection.write_message(&message).await
+                            // A partial frame cannot be retried on this connection. A
+                            // stalled write permanently fences this writer and its queue.
+                            match tokio::time::timeout(WRITE_TIMEOUT, writer_connection.write_message(&message)).await {
+                                Ok(result) => result,
+                                Err(_) => Err(Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "IB socket write timed out"))),
+                            }
                         } else {
                             drop(order_claim.take());
                             Err(Error::ConnectionReset)
                         };
+                        let failed = !stale && write_result.is_err();
+                        if failed {
+                            writer_connected.store(false, Ordering::Release);
+                            writer_epoch.fetch_add(1, Ordering::AcqRel);
+                            writer_shutdown.store(true, Ordering::Release);
+                            writer_notify.notify_one();
+                        }
                         let _ = result.send(write_result);
+                        if failed {
+                            // Dropping queued commands fails their waiters and rolls back
+                            // only uncommitted ID claims. Nothing else may reach this socket.
+                            break;
+                        }
                     }
                     WriteCommand::Reconnect { result, resume } => {
-                        let reconnect_result = writer_connection.reconnect().await;
+                        let reconnect_result = tokio::time::timeout(WRITE_TIMEOUT, writer_connection.reconnect())
+                            .await
+                            .unwrap_or(Err(Error::ConnectionFailed));
                         let reconnected = reconnect_result.is_ok();
                         let _ = result.send(reconnect_result);
                         if reconnected {
                             let _ = resume.await;
                         }
-                    }
-                    WriteCommand::Shutdown { acknowledged } => {
-                        write_receiver.close();
-                        while let Some(command) = write_receiver.recv().await {
-                            match command {
-                                WriteCommand::Message { order_claim, result, .. } => {
-                                    drop(order_claim);
-                                    let _ = result.send(Err(Error::Shutdown));
-                                }
-                                WriteCommand::Reconnect { result, .. } => {
-                                    let _ = result.send(Err(Error::Shutdown));
-                                }
-                                WriteCommand::Shutdown { acknowledged } => {
-                                    let _ = acknowledged.send(());
-                                }
-                            }
-                        }
-                        let _ = acknowledged.send(());
-                        break;
                     }
                 }
             }
@@ -391,13 +393,12 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
             order_update_stream: Arc::new(RwLock::new(None)),
             cleanup_sender,
             write_sender,
-            write_task: StdMutex::new(Some(write_task)),
-            writer_shutdown_started: AtomicBool::new(false),
+            write_task: Mutex::new(Some(write_task)),
             connection_epoch,
             process_task: Arc::new(RwLock::new(None)),
-            shutdown_requested: Arc::new(AtomicBool::new(false)),
-            shutdown_notify: Arc::new(Notify::new()),
-            connected: Arc::new(AtomicBool::new(true)),
+            shutdown_requested,
+            shutdown_notify,
+            connected,
         };
 
         // Start cleanup task
@@ -498,14 +499,10 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
     }
 
     async fn shutdown_writer(&self) {
-        if !self.writer_shutdown_started.swap(true, Ordering::AcqRel) {
-            let (acknowledged, acknowledgement) = oneshot::channel();
-            if self.write_sender.send(WriteCommand::Shutdown { acknowledged }).is_ok() {
-                let _ = acknowledgement.await;
-            }
-        }
-        let task = self.write_task.lock().ok().and_then(|mut task| task.take());
-        if let Some(task) = task {
+        self.connection_epoch.fetch_add(1, Ordering::AcqRel);
+        let mut task = self.write_task.lock().await;
+        if let Some(task) = task.take() {
+            task.abort();
             let _ = task.await;
         }
     }
@@ -546,6 +543,7 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
                 tokio::select! {
                     _ = shutdown_notify.notified() => {
                         debug!("Shutdown notification received, stopping message processing");
+                        message_bus.request_shutdown().await;
                         break;
                     }
                     result = message_bus.read_and_route_message() => {

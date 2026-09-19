@@ -480,8 +480,9 @@ async fn test_data_stream_filters_notices() {
     drop(tx);
 
     let collected: Vec<_> = subscription.filter_data().collect().await;
-    assert_eq!(collected.len(), 1);
+    assert_eq!(collected.len(), 2);
     assert_eq!(collected[0].as_ref().unwrap(), "data");
+    assert!(matches!(collected[1], Err(Error::UnexpectedEndOfStream)));
 }
 
 /// PR 3: dispatcher emits `RoutedItem::Notice`; `Subscription<T>::next()`
@@ -731,4 +732,49 @@ async fn test_collect_for_filters_notices() {
     let collected = sub.collect_for(Duration::from_secs(30)).await;
 
     assert_eq!(collected, vec![CollectItem(10), CollectItem(20)]);
+}
+
+#[tokio::test]
+async fn position_overflow_fails_before_accepting_an_incomplete_snapshot() {
+    use crate::accounts::PositionUpdate;
+    use crate::common::test_utils::helpers::proto_response;
+    use crate::messages::IncomingMessages;
+    use crate::testdata::builders::positions::{position, position_end};
+    use crate::testdata::builders::ResponseProtoEncoder;
+    use crate::transport::r#async::BROADCAST_CHANNEL_CAPACITY;
+
+    let bus = Arc::new(MessageBusStub::default());
+    let (tx, rx) = broadcast::channel(BROADCAST_CHANNEL_CAPACITY);
+    let mut sub = Subscription::<PositionUpdate>::with_decoder(
+        AsyncInternalSubscription::new(rx),
+        bus,
+        PositionUpdate::decode,
+        None,
+        None,
+        DecoderContext::default(),
+    );
+    for id in 1..=BROADCAST_CHANNEL_CAPACITY {
+        tx.send(proto_response(IncomingMessages::Position, position().contract_id(id as i32).encode_proto()).into())
+            .unwrap();
+    }
+    tx.send(proto_response(IncomingMessages::PositionEnd, position_end().encode_proto()).into())
+        .unwrap();
+    assert!(matches!(sub.next().await, Some(Err(Error::SubscriptionLagged(1)))));
+    assert!(sub.next().await.is_none(), "PositionEnd must not follow lost rows");
+}
+
+#[tokio::test]
+async fn transport_closure_is_not_a_broker_snapshot_end() {
+    let (tx, rx) = broadcast::channel(4);
+    let mut sub = Subscription::<Bar>::with_decoder(
+        AsyncInternalSubscription::new(rx),
+        Arc::new(MessageBusStub::default()),
+        |_context, _message| Err(Error::EndOfStream),
+        None,
+        None,
+        DecoderContext::default(),
+    );
+    drop(tx);
+    assert!(matches!(sub.next().await, Some(Err(Error::UnexpectedEndOfStream))));
+    assert!(sub.next().await.is_none());
 }

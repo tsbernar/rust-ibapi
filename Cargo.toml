@@ -64,6 +64,7 @@ futures = { version = "0.3.31", optional = true }
 async-trait = { version = "0.1.83", optional = true }
 
 [dev-dependencies]
+tokio = { version = "1.41", features = ["test-util"] }
 anyhow = "1.0.92"
 clap = { version = "4.5.20", features = ["derive"] }
 env_logger = "0.11.5"

@@ -983,24 +983,18 @@ async fn shutdown_result_is_reported_only_after_queued_order_claim_is_rolled_bac
     let blocking_write = bus.enqueue_write_message(b"blocking-write".to_vec(), epoch).unwrap();
     stream.wait_for_write_started().await;
 
-    let (acknowledged, acknowledgement) = oneshot::channel();
-    assert!(bus.write_sender.send(WriteCommand::Shutdown { acknowledged }).is_ok());
     let claim = bus.id_origins.claim_order(42).unwrap().into_owned(bus.id_origins.clone());
     let queued_order = bus.enqueue_order_write_message(b"unsent-order".to_vec(), epoch, claim).unwrap();
 
-    stream.release_write();
-    AsyncTcpMessageBus::<MemoryStream>::finish_write_message(blocking_write).await.unwrap();
-    assert!(matches!(
-        AsyncTcpMessageBus::<MemoryStream>::finish_write_message(queued_order).await,
-        Err(Error::Shutdown)
-    ));
+    bus.ensure_shutdown().await;
+    assert!(AsyncTcpMessageBus::<MemoryStream>::finish_write_message(blocking_write).await.is_err());
+    assert!(AsyncTcpMessageBus::<MemoryStream>::finish_write_message(queued_order).await.is_err());
     assert_eq!(bus.id_origins.origin(42), None);
     drop(
         bus.id_origins
             .claim_request(42)
             .expect("shutdown result must guarantee the stale order owner is gone"),
     );
-    acknowledgement.await.expect("writer did not acknowledge shutdown");
 }
 
 #[tokio::test]
@@ -1188,4 +1182,83 @@ async fn test_send_shared_request_unsupported_returns_error() {
         Err(Error::InvalidArgument(_)) => {}
         other => panic!("expected Error::InvalidArgument, got {:?}", other.err()),
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_write_fences_queued_orders_and_shutdown_completes() {
+    let (stream, bus) = make_bus();
+    stream.block_next_partial_write();
+    let sender = bus.clone();
+    let first = tokio::spawn(async move { sender.send_order_message(42, b"partial-frame".to_vec()).await });
+    stream.wait_for_write_started().await;
+    let partial = stream.captured();
+    assert!(!partial.is_empty() && partial.len() < 17);
+    let epoch = bus.begin_write().unwrap();
+    let claim = bus.id_origins.claim_order(43).unwrap().into_owned(bus.id_origins.clone());
+    let queued = bus.enqueue_order_write_message(b"must-not-send".to_vec(), epoch, claim).unwrap();
+    tokio::time::advance(WRITE_TIMEOUT).await;
+    assert!(first.await.unwrap().is_err());
+    assert!(AsyncTcpMessageBus::<MemoryStream>::finish_write_message(queued).await.is_err());
+    assert!(!bus.is_connected());
+    assert!(bus.send_order_message(44, b"later-order".to_vec()).await.is_err());
+    assert_eq!(stream.captured(), partial);
+    assert_eq!(bus.id_origins.origin(42), Some(IdOrigin::Order));
+    assert_eq!(bus.id_origins.origin(43), None);
+    tokio::time::timeout(Duration::from_secs(1), bus.ensure_shutdown()).await.unwrap();
+    stream.release_write();
+    tokio::task::yield_now().await;
+    assert_eq!(stream.captured(), partial);
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_aborts_in_progress_write_without_waiting_for_the_socket() {
+    let (stream, bus) = make_bus();
+    stream.block_next_write();
+    let sender = bus.clone();
+    let pending = tokio::spawn(async move { sender.send_message(b"partial-frame".to_vec()).await });
+    stream.wait_for_write_started().await;
+    tokio::time::timeout(Duration::from_secs(1), bus.ensure_shutdown()).await.unwrap();
+    assert!(pending.await.unwrap().is_err());
+    assert!(!bus.is_connected());
+}
+
+#[tokio::test]
+async fn replacement_position_stream_ignores_old_rows_and_end_and_keeps_live_updates() {
+    use crate::accounts::{types::AccountId, PositionUpdateMulti};
+    use crate::messages::{encode_protobuf_message, IncomingMessages};
+    use crate::subscriptions::SubscriptionItem;
+    use crate::testdata::builders::{
+        positions::{position_multi, position_multi_end},
+        ResponseProtoEncoder,
+    };
+    let (stream, bus) = make_bus();
+    let client = crate::Client::stubbed(bus.clone(), server_versions::PROTOBUF_REST_MESSAGES_3);
+    let account = AccountId("DU1234567".into());
+    let old = client.positions_multi(Some(&account), None).await.unwrap();
+    let mut current = client.positions_multi(Some(&account), None).await.unwrap();
+    drop(old);
+    tokio::task::yield_now().await;
+    for (request_id, quantity) in [(9000, 999.0), (9001, 7.0)] {
+        stream.push_inbound(encode_protobuf_message(
+            IncomingMessages::PositionMulti as i32,
+            &position_multi().request_id(request_id).position(quantity).encode_proto(),
+        ));
+        bus.read_and_route_message().await.unwrap();
+        stream.push_inbound(encode_protobuf_message(
+            IncomingMessages::PositionMultiEnd as i32,
+            &position_multi_end().request_id(request_id).encode_proto(),
+        ));
+        bus.read_and_route_message().await.unwrap();
+    }
+    assert!(matches!(current.next().await, Some(Ok(SubscriptionItem::Data(PositionUpdateMulti::Position(p)))) if p.position == 7.0));
+    assert!(matches!(
+        current.next().await,
+        Some(Ok(SubscriptionItem::Data(PositionUpdateMulti::PositionEnd)))
+    ));
+    stream.push_inbound(encode_protobuf_message(
+        IncomingMessages::PositionMulti as i32,
+        &position_multi().request_id(9001).position(8.0).encode_proto(),
+    ));
+    bus.read_and_route_message().await.unwrap();
+    assert!(matches!(current.next().await, Some(Ok(SubscriptionItem::Data(PositionUpdateMulti::Position(p)))) if p.position == 8.0));
 }
