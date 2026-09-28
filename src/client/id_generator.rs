@@ -46,12 +46,22 @@ impl IdGenerator {
 
     /// Atomically reserves and returns an ID at or above `floor`.
     pub(crate) fn reserve_at_least(&self, floor: i32) -> i32 {
+        self.try_reserve_at_least(floor).expect("invalid or exhausted IB API ID sequence")
+    }
+
+    pub(crate) fn try_reserve_at_least(&self, floor: i32) -> Option<i32> {
+        if floor < 0 {
+            return None;
+        }
         let mut observed = self.next_id.load(Ordering::Relaxed);
         loop {
+            if observed < 0 {
+                return None;
+            }
             let reserved = observed.max(floor);
-            let next = reserved.checked_add(1).expect("IB API ID sequence exhausted i32");
+            let next = reserved.checked_add(1)?;
             match self.next_id.compare_exchange_weak(observed, next, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => return reserved,
+                Ok(_) => return Some(reserved),
                 Err(actual) => observed = actual,
             }
         }
@@ -108,6 +118,10 @@ impl ClientIdManager {
     /// Atomically reserves an order ID at or above the server-provided floor.
     pub(crate) fn reserve_order_id_at_least(&self, order_id: i32) -> i32 {
         self.ids.reserve_at_least(order_id)
+    }
+
+    pub(crate) fn try_reserve_order_id_at_least(&self, order_id: i32) -> Option<i32> {
+        self.ids.try_reserve_at_least(order_id)
     }
 
     /// Gets the current order ID without incrementing

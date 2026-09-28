@@ -96,3 +96,29 @@ fn test_client_id_manager() {
     manager.set_order_id(10_000);
     assert_eq!(manager.next_request_id(), 10_000);
 }
+
+#[test]
+fn concurrent_large_floor_reservations_and_requests_do_not_collide() {
+    let manager = Arc::new(ClientIdManager::new(143512));
+    let threads = (0..8)
+        .map(|worker| {
+            let manager = Arc::clone(&manager);
+            thread::spawn(move || {
+                (0..100)
+                    .map(|_| {
+                        if worker % 2 == 0 {
+                            manager.try_reserve_order_id_at_least(1_700_000_001).unwrap()
+                        } else {
+                            manager.next_request_id()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut ids = threads.into_iter().flat_map(|t| t.join().unwrap()).collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), 800);
+    assert!(manager.next_order_id() > 1_700_000_001);
+}
