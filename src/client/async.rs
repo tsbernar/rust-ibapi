@@ -274,6 +274,18 @@ impl Client {
         self.id_manager.set_order_id(order_id);
     }
 
+    /// Atomically reserves an order ID at or above `floor` from the shared
+    /// request/order sequence, without iterating over skipped IDs or contacting TWS.
+    /// Concurrent request and order allocations cannot reuse the reserved ID.
+    ///
+    /// Returns an error without advancing the sequence if `floor` is negative
+    /// or no ID with a representable successor remains.
+    pub fn try_reserve_order_id_at_least(&self, floor: i32) -> Result<i32, Error> {
+        self.id_manager
+            .try_reserve_order_id_at_least(floor)
+            .ok_or_else(|| Error::InvalidArgument("invalid or exhausted IB API ID sequence".into()))
+    }
+
     pub(crate) fn reserve_order_id_at_least(&self, order_id: i32) -> i32 {
         self.id_manager.reserve_order_id_at_least(order_id)
     }

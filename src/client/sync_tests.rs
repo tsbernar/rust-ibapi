@@ -183,3 +183,17 @@ fn builder_connect_with_notice_stream_captures_handshake_notice() {
         .expect("timed out waiting for handshake notice");
     assert_eq!(n.code, 2104);
 }
+
+#[test]
+fn atomic_order_floor_handles_large_gaps_without_rewinding_requests() {
+    let client = stubbed_client();
+    assert_eq!(client.try_reserve_order_id_at_least(1_700_000_001).unwrap(), 1_700_000_001);
+    assert_eq!(client.next_request_id(), 1_700_000_002);
+    assert_eq!(client.try_reserve_order_id_at_least(143512).unwrap(), 1_700_000_003);
+    assert_eq!(client.next_order_id(), 1_700_000_004);
+    assert!(client.try_reserve_order_id_at_least(-1).is_err());
+    assert!(client.try_reserve_order_id_at_least(i32::MAX).is_err());
+    assert_eq!(client.next_request_id(), 1_700_000_005);
+    assert_eq!(client.try_reserve_order_id_at_least(i32::MAX - 1).unwrap(), i32::MAX - 1);
+    assert!(client.try_reserve_order_id_at_least(0).is_err());
+}
