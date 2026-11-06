@@ -212,6 +212,57 @@ fn test_decode_historical_data_end_proto() {
 }
 
 #[test]
+fn test_historical_data_end_repeated_hour_response() {
+    // Captured from NGZ26, 5 D / 1 day / TRADES / RTH, ending 20261106-06:27:12 UTC.
+    let response = b"\x08\xa9\x46\x12\x1c20261101 01:27:12 US/Eastern\x1a\x1c20261106 01:27:12 US/Eastern";
+    let error = decode_historical_data_end_proto(response).unwrap_err();
+    match error {
+        Error::Parse(_, value, reason) => {
+            assert_eq!(value, "20261101 01:27:12 US/Eastern");
+            assert!(reason.contains("ambiguous"));
+        }
+        other => panic!("expected a parse error, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_historical_data_end_rejects_invalid_local_boundaries() {
+    for (timestamp, reason) in [
+        ("20261101 01:27:12 US/Eastern", "ambiguous"),
+        ("20260308 02:30:00 US/Eastern", "nonexistent"),
+    ] {
+        for invalid_start in [true, false] {
+            let valid = "20261106 01:27:12 US/Eastern";
+            let response = crate::proto::HistoricalDataEnd {
+                req_id: Some(1),
+                start_date_str: Some(if invalid_start { timestamp } else { valid }.into()),
+                end_date_str: Some(if invalid_start { valid } else { timestamp }.into()),
+            };
+            match decode_historical_data_end_proto(&response.encode_to_vec()).unwrap_err() {
+                Error::Parse(_, value, description) => {
+                    assert_eq!(value, timestamp);
+                    assert!(description.contains(reason));
+                }
+                other => panic!("expected a parse error, got {other:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn test_historical_boundary_unambiguous_offsets() {
+    for (timestamp, expected) in [
+        ("20261101 00:59:59 US/Eastern", datetime!(2026-11-01 04:59:59 UTC)),
+        ("20261101 02:00:00 US/Eastern", datetime!(2026-11-01 07:00:00 UTC)),
+        ("20261101 01:27:12 UTC", datetime!(2026-11-01 01:27:12 UTC)),
+        ("20260308 01:59:59 US/Eastern", datetime!(2026-03-08 06:59:59 UTC)),
+        ("20260308 03:00:00 US/Eastern", datetime!(2026-03-08 07:00:00 UTC)),
+    ] {
+        assert_eq!(parse_date_with_tz(timestamp).unwrap(), expected, "{timestamp}");
+    }
+}
+
+#[test]
 fn test_decode_historical_schedule_proto() {
     let proto_msg = crate::proto::HistoricalSchedule {
         req_id: Some(1),

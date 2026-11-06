@@ -1,6 +1,6 @@
 use time::macros::format_description;
 use time::{Date, OffsetDateTime, PrimitiveDateTime};
-use time_tz::{PrimitiveDateTimeExt, Tz};
+use time_tz::{OffsetResult, PrimitiveDateTimeExt, Tz};
 
 use crate::common::timezone::find_timezone;
 use crate::messages::ResponseMessage;
@@ -91,7 +91,11 @@ fn parse_date_with_tz(text: &str) -> Result<OffsetDateTime, Error> {
         .ok_or_else(|| Error::parse_field(text, "expected 'YYYYMMDD HH:MM:SS TZ'"))?;
     let tz = parse_time_zone(tz_name.trim())?;
     let dt = PrimitiveDateTime::parse(datetime_part, fmt)?;
-    Ok(dt.assume_timezone(tz).unwrap())
+    match dt.assume_timezone(tz) {
+        OffsetResult::Some(timestamp) => Ok(timestamp),
+        OffsetResult::Ambiguous(_, _) => Err(Error::parse_field(text, "ambiguous local timestamp in historical data boundary")),
+        OffsetResult::None => Err(Error::parse_field(text, "nonexistent local timestamp in historical data boundary")),
+    }
 }
 
 // === Protobuf decoders ===
