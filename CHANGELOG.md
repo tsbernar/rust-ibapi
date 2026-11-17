@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Route market-data-type callbacks to the originating ticker subscription, preserving realtime confirmation and frozen/delayed notifications for async and blocking clients.
+
 - Async snapshot market-data subscriptions no longer send a redundant cancel after the snapshot completes, matching the sync side (#686).
 - `Notice` now preserves the request or order ID decoded from TWS error frames, allowing consumers to associate broker rejections with the originating request.
 - The multiplexed order-update stream now surfaces broker errors for known order IDs as typed, nonterminal `Notice` values instead of silently dropping undecodable raw error frames, while an ID-origin registry prevents non-order request errors from leaking into order diagnostics.

@@ -1837,3 +1837,29 @@ fn test_reset_notifies_all_channel_categories() -> Result<(), Error> {
     ));
     Ok(())
 }
+
+#[test]
+fn market_data_type_reaches_only_its_market_data_subscription() -> Result<(), Error> {
+    use prost::Message;
+    let (stream, bus) = make_bus();
+    let live = bus.send_request(100, &[])?;
+    let delayed = bus.send_request(200, &[])?;
+    for (request_id, kind) in [(200, 3), (100, 1)] {
+        stream.push_inbound(binary_proto(
+            IncomingMessages::MarketDataType as i32,
+            &crate::proto::MarketDataType {
+                req_id: Some(request_id),
+                market_data_type: Some(kind),
+            },
+        ));
+        bus.dispatch()?;
+    }
+    for (subscription, expected_id, expected_kind) in [(&live, 100, 1), (&delayed, 200, 3)] {
+        let message = subscription.next_timeout(TICK).expect("market data type callback missing")?;
+        assert_eq!(message.request_id(), Some(expected_id));
+        let data = crate::proto::MarketDataType::decode(message.raw_bytes().unwrap()).unwrap();
+        assert_eq!(data.market_data_type, Some(expected_kind));
+        assert!(subscription.try_next().is_none());
+    }
+    Ok(())
+}

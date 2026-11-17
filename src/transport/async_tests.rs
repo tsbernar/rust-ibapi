@@ -1262,3 +1262,28 @@ async fn replacement_position_stream_ignores_old_rows_and_end_and_keeps_live_upd
     bus.read_and_route_message().await.unwrap();
     assert!(matches!(current.next().await, Some(Ok(SubscriptionItem::Data(PositionUpdateMulti::Position(p)))) if p.position == 8.0));
 }
+
+#[tokio::test]
+async fn market_data_type_reaches_only_its_market_data_subscription() {
+    use prost::Message;
+    let (stream, bus) = make_bus();
+    let mut live = bus.send_request(100, vec![]).await.unwrap();
+    let mut delayed = bus.send_request(200, vec![]).await.unwrap();
+    for (request_id, kind) in [(200, 3), (100, 1)] {
+        stream.push_inbound(binary_proto(
+            IncomingMessages::MarketDataType as i32,
+            &crate::proto::MarketDataType {
+                req_id: Some(request_id),
+                market_data_type: Some(kind),
+            },
+        ));
+        bus.read_and_route_message().await.unwrap();
+    }
+    for (subscription, expected_id, expected_kind) in [(&mut live, 100, 1), (&mut delayed, 200, 3)] {
+        let message = next_message(subscription).await;
+        assert_eq!(message.request_id(), Some(expected_id));
+        let data = crate::proto::MarketDataType::decode(message.raw_bytes().unwrap()).unwrap();
+        assert_eq!(data.market_data_type, Some(expected_kind));
+        assert!(subscription.try_next_routed().is_none());
+    }
+}
