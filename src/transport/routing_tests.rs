@@ -326,3 +326,18 @@ fn test_determine_routing_protobuf_request_id_message() {
         routing => panic!("Expected ByRequestId(314), got {routing:?}"),
     }
 }
+
+#[test]
+fn market_data_type_routes_to_its_ticker() {
+    for (request_id, kind) in [(100, 1), (200, 2), (300, 3), (400, 4)] {
+        let message = proto_response(
+            IncomingMessages::MarketDataType,
+            crate::proto::MarketDataType {
+                req_id: Some(request_id),
+                market_data_type: Some(kind),
+            }
+            .encode_to_vec(),
+        );
+        assert_eq!(determine_routing(&message), RoutingDecision::ByRequestId(request_id));
+    }
+}

@@ -425,6 +425,7 @@ pub(crate) fn text_request_id_field(kind: IncomingMessages) -> Option<usize> {
         | IncomingMessages::ExecutionDataEnd
         | IncomingMessages::MarketDepth
         | IncomingMessages::MarketDepthL2
+        | IncomingMessages::MarketDataType
         | IncomingMessages::PositionMulti
         | IncomingMessages::PositionMultiEnd
         | IncomingMessages::RealTimeBars
